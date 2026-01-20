@@ -4,6 +4,7 @@ import { createCliRenderer, TextRenderable, BoxRenderable, ScrollBoxRenderable, 
 import { spawn } from 'child_process';
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { join } from 'path';
+import kill from 'tree-kill';
 
 // Configuration
 const DEFAULTS_FILE = './.last-selected-scripts.json';
@@ -63,9 +64,11 @@ class ProcessManager {
     this.outputLines = [];
     this.filter = '';
     this.maxOutputLines = 1000;
+    this.maxVisibleLines = 30;  // Number of recent lines to show when not paused
     this.isPaused = false;  // Whether output scrolling is paused
+    this.wasPaused = false;  // Track previous pause state to detect changes
     this.isFilterMode = false;  // Whether in filter input mode
-    this.outputScrollBox = null;  // Reference to the scrollable output container
+    this.outputBox = null;  // Reference to the output container
     this.lastRenderedLineCount = 0;  // Track how many lines we've rendered
     this.headerRenderable = null;  // Reference to header text in running UI
     this.processListRenderable = null;  // Reference to process list text in running UI
@@ -172,22 +175,13 @@ class ProcessManager {
           this.isPaused = false;
           this.buildRunningUI(); // Rebuild to clear filter
         } else if (keyName === 'up' || keyName === 'k') {
-          // If paused, scroll the output; otherwise navigate processes
-          if (this.isPaused && this.outputScrollBox) {
-            // Scroll output up
-            this.outputScrollBox.focus();
-          } else {
-            this.selectedIndex = Math.max(0, this.selectedIndex - 1);
-            this.buildRunningUI(); // Rebuild to show selection change
-          }
+          // Navigate processes up
+          this.selectedIndex = Math.max(0, this.selectedIndex - 1);
+          this.buildRunningUI(); // Rebuild to show selection change
         } else if (keyName === 'down' || keyName === 'j') {
-          if (this.isPaused && this.outputScrollBox) {
-            // Scroll output down
-            this.outputScrollBox.focus();
-          } else {
-            this.selectedIndex = Math.min(this.scripts.length - 1, this.selectedIndex + 1);
-            this.buildRunningUI(); // Rebuild to show selection change
-          }
+          // Navigate processes down
+          this.selectedIndex = Math.min(this.scripts.length - 1, this.selectedIndex + 1);
+          this.buildRunningUI(); // Rebuild to show selection change
         } else if (keyName === 'left' || keyName === 'h') {
           // Navigate processes left
           this.selectedIndex = Math.max(0, this.selectedIndex - 1);
@@ -196,18 +190,6 @@ class ProcessManager {
           // Navigate processes right
           this.selectedIndex = Math.min(this.scripts.length - 1, this.selectedIndex + 1);
           this.buildRunningUI(); // Rebuild to show selection change
-        } else if (keyName === 'pageup') {
-          // Page up in output
-          if (this.outputScrollBox) {
-            this.isPaused = true;
-            this.outputScrollBox.focus();
-          }
-        } else if (keyName === 'pagedown') {
-          // Page down in output
-          if (this.outputScrollBox) {
-            this.isPaused = true;
-            this.outputScrollBox.focus();
-          }
         } else if (keyName === 'r') {
           const scriptName = this.scripts[this.selectedIndex]?.name;
           if (scriptName) {
@@ -349,6 +331,7 @@ class ProcessManager {
   }
 
   addOutputLine(processName, text) {
+    // Always store the output line, even when paused
     this.outputLines.push({
       process: processName,
       text,
@@ -359,17 +342,23 @@ class ProcessManager {
       this.outputLines = this.outputLines.slice(-this.maxOutputLines);
     }
     
-    // Render to update output
-    this.render();
-    
-    // With reverse scroll (newest at top), no need to scroll anywhere
-    // New messages appear at the top automatically
+    // Only render if not paused - this prevents new output from appearing
+    // when the user is reviewing history
+    if (!this.isPaused) {
+      this.render();
+    }
   }
 
   stopProcess(scriptName) {
     const proc = this.processRefs.get(scriptName);
-    if (proc) {
-      proc.kill();
+    if (proc && proc.pid) {
+      // Use tree-kill to kill the entire process tree
+      kill(proc.pid, 'SIGTERM', (err) => {
+        if (err) {
+          // If SIGTERM fails, try SIGKILL
+          kill(proc.pid, 'SIGKILL');
+        }
+      });
       this.processRefs.delete(scriptName);
       this.processes.set(scriptName, { status: 'stopped' });
       this.addOutputLine(scriptName, 'Process stopped');
@@ -396,7 +385,9 @@ class ProcessManager {
   cleanup() {
     for (const [scriptName, proc] of this.processRefs.entries()) {
       try {
-        proc.kill();
+        if (proc.pid) {
+          kill(proc.pid, 'SIGKILL');
+        }
       } catch (err) {
         // Ignore
       }
@@ -615,55 +606,9 @@ class ProcessManager {
   }
   
   updateRunningUI() {
-    // If running UI doesn't exist yet, build it
-    if (!this.runningContainer || !this.outputScrollBox) {
-      this.buildRunningUI();
-      return;
-    }
-    
-    // Only add new lines that haven't been rendered yet
-    const filteredLines = this.filter 
-      ? this.outputLines.filter(line => 
-          line.process.toLowerCase().includes(this.filter.toLowerCase()) || 
-          line.text.toLowerCase().includes(this.filter.toLowerCase())
-        )
-      : this.outputLines;
-    
-    // If filter changed, need to rebuild
-    const currentFilteredCount = filteredLines.length;
-    if (this.lastRenderedLineCount > currentFilteredCount) {
-      // Filter was applied or changed, rebuild
-      this.buildRunningUI();
-      return;
-    }
-    
-    // For reverse order, we need to rebuild the entire scrollbox
-    // Clear and re-add all lines in reverse order
-    // Only do this if we have new lines
-    const newLineCount = filteredLines.length - this.lastRenderedLineCount;
-    if (newLineCount > 0) {
-      // Clear all existing output
-      while (this.outputScrollBox.children && this.outputScrollBox.children.length > 0) {
-        const child = this.outputScrollBox.children[0];
-        this.outputScrollBox.remove(child);
-        child.destroy();
-      }
-      
-      // Add all lines in reverse order (newest first)
-      for (let i = filteredLines.length - 1; i >= 0; i--) {
-        const line = filteredLines[i];
-        const processColor = this.processColors.get(line.process) || '#FFFFFF';
-        const outputLine = new TextRenderable(this.renderer, {
-          id: `output-${i}`,
-          content: t`${fg(processColor)(`[${line.process}]`)} ${line.text}`,
-        });
-        this.outputScrollBox.add(outputLine);
-      }
-      
-      this.lastRenderedLineCount = filteredLines.length;
-    }
-    
-    this.lastRenderedLineCount = currentFilteredCount;
+    // Just rebuild the entire UI - simpler and more reliable
+    // OpenTUI doesn't have great incremental update support anyway
+    this.buildRunningUI();
   }
   
   buildRunningUI() {
@@ -710,95 +655,31 @@ class ProcessManager {
     let currentY = 4; // padding + header + spacer + 1 for 1-based coords
     this.scriptLinePositions = [];
     
-    // Process list - compact layout with colors
-    // Build the styled text using template literal properly
-    let processContent;
-    if (this.scripts.length === 0) {
-      processContent = 'No processes';
-    } else if (this.scripts.length === 1) {
-      const script = this.scripts[0];
+    // Process list - compact horizontal layout with all processes
+    // Create a container to hold all process items in a row
+    const processListContainer = new BoxRenderable(this.renderer, {
+      id: 'process-list-container',
+      flexDirection: 'row',
+      gap: 2,
+    });
+    
+    // Add each process as a separate text element
+    this.scripts.forEach((script, index) => {
       const proc = this.processes.get(script.name);
       const status = proc?.status || 'stopped';
-      const statusIcon = status === 'running' ? '●' : status === 'crashed' ? '✖' : status === 'exited' ? '○' : '○';
+      const icon = status === 'running' ? '●' : status === 'crashed' ? '✖' : '○';
       const statusColor = status === 'running' ? '#00FF00' : status === 'crashed' ? '#FF0000' : '#666666';
       const processColor = this.processColors.get(script.name) || '#FFFFFF';
-      processContent = t`▶${fg(processColor)(script.displayName)} ${fg(statusColor)(statusIcon)}`;
-    } else if (this.scripts.length === 2) {
-      const s0 = this.scripts[0];
-      const s1 = this.scripts[1];
-      const proc0 = this.processes.get(s0.name);
-      const proc1 = this.processes.get(s1.name);
-      const status0 = proc0?.status || 'stopped';
-      const status1 = proc1?.status || 'stopped';
-      const icon0 = status0 === 'running' ? '●' : status0 === 'crashed' ? '✖' : '○';
-      const icon1 = status1 === 'running' ? '●' : status1 === 'crashed' ? '✖' : '○';
-      const color0 = status0 === 'running' ? '#00FF00' : status0 === 'crashed' ? '#FF0000' : '#666666';
-      const color1 = status1 === 'running' ? '#00FF00' : status1 === 'crashed' ? '#FF0000' : '#666666';
-      const pcolor0 = this.processColors.get(s0.name) || '#FFFFFF';
-      const pcolor1 = this.processColors.get(s1.name) || '#FFFFFF';
-      const prefix0 = this.selectedIndex === 0 ? '▶' : '';
-      const prefix1 = this.selectedIndex === 1 ? '▶' : '';
-      processContent = t`${prefix0}${fg(pcolor0)(s0.displayName)} ${fg(color0)(icon0)}  ${prefix1}${fg(pcolor1)(s1.displayName)} ${fg(color1)(icon1)}`;
-    } else if (this.scripts.length === 3) {
-      const s0 = this.scripts[0];
-      const s1 = this.scripts[1];
-      const s2 = this.scripts[2];
-      const proc0 = this.processes.get(s0.name);
-      const proc1 = this.processes.get(s1.name);
-      const proc2 = this.processes.get(s2.name);
-      const status0 = proc0?.status || 'stopped';
-      const status1 = proc1?.status || 'stopped';
-      const status2 = proc2?.status || 'stopped';
-      const icon0 = status0 === 'running' ? '●' : status0 === 'crashed' ? '✖' : '○';
-      const icon1 = status1 === 'running' ? '●' : status1 === 'crashed' ? '✖' : '○';
-      const icon2 = status2 === 'running' ? '●' : status2 === 'crashed' ? '✖' : '○';
-      const color0 = status0 === 'running' ? '#00FF00' : status0 === 'crashed' ? '#FF0000' : '#666666';
-      const color1 = status1 === 'running' ? '#00FF00' : status1 === 'crashed' ? '#FF0000' : '#666666';
-      const color2 = status2 === 'running' ? '#00FF00' : status2 === 'crashed' ? '#FF0000' : '#666666';
-      const pcolor0 = this.processColors.get(s0.name) || '#FFFFFF';
-      const pcolor1 = this.processColors.get(s1.name) || '#FFFFFF';
-      const pcolor2 = this.processColors.get(s2.name) || '#FFFFFF';
-      const prefix0 = this.selectedIndex === 0 ? '▶' : '';
-      const prefix1 = this.selectedIndex === 1 ? '▶' : '';
-      const prefix2 = this.selectedIndex === 2 ? '▶' : '';
-      processContent = t`${prefix0}${fg(pcolor0)(s0.displayName)} ${fg(color0)(icon0)}  ${prefix1}${fg(pcolor1)(s1.displayName)} ${fg(color1)(icon1)}  ${prefix2}${fg(pcolor2)(s2.displayName)} ${fg(color2)(icon2)}`;
-    } else {
-      // 4+ processes
-      const s0 = this.scripts[0];
-      const s1 = this.scripts[1];
-      const s2 = this.scripts[2];
-      const s3 = this.scripts[3];
-      const proc0 = this.processes.get(s0.name);
-      const proc1 = this.processes.get(s1.name);
-      const proc2 = this.processes.get(s2.name);
-      const proc3 = this.processes.get(s3.name);
-      const status0 = proc0?.status || 'stopped';
-      const status1 = proc1?.status || 'stopped';
-      const status2 = proc2?.status || 'stopped';
-      const status3 = proc3?.status || 'stopped';
-      const icon0 = status0 === 'running' ? '●' : status0 === 'crashed' ? '✖' : '○';
-      const icon1 = status1 === 'running' ? '●' : status1 === 'crashed' ? '✖' : '○';
-      const icon2 = status2 === 'running' ? '●' : status2 === 'crashed' ? '✖' : '○';
-      const icon3 = status3 === 'running' ? '●' : status3 === 'crashed' ? '✖' : '○';
-      const color0 = status0 === 'running' ? '#00FF00' : status0 === 'crashed' ? '#FF0000' : '#666666';
-      const color1 = status1 === 'running' ? '#00FF00' : status1 === 'crashed' ? '#FF0000' : '#666666';
-      const color2 = status2 === 'running' ? '#00FF00' : status2 === 'crashed' ? '#FF0000' : '#666666';
-      const color3 = status3 === 'running' ? '#00FF00' : status3 === 'crashed' ? '#FF0000' : '#666666';
-      const pcolor0 = this.processColors.get(s0.name) || '#FFFFFF';
-      const pcolor1 = this.processColors.get(s1.name) || '#FFFFFF';
-      const pcolor2 = this.processColors.get(s2.name) || '#FFFFFF';
-      const pcolor3 = this.processColors.get(s3.name) || '#FFFFFF';
-      const prefix0 = this.selectedIndex === 0 ? '▶' : '';
-      const prefix1 = this.selectedIndex === 1 ? '▶' : '';
-      const prefix2 = this.selectedIndex === 2 ? '▶' : '';
-      const prefix3 = this.selectedIndex === 3 ? '▶' : '';
-      processContent = t`${prefix0}${fg(pcolor0)(s0.displayName)} ${fg(color0)(icon0)}  ${prefix1}${fg(pcolor1)(s1.displayName)} ${fg(color1)(icon1)}  ${prefix2}${fg(pcolor2)(s2.displayName)} ${fg(color2)(icon2)}  ${prefix3}${fg(pcolor3)(s3.displayName)} ${fg(color3)(icon3)}`;
-    }
-    
-    this.processListRenderable = new TextRenderable(this.renderer, {
-      id: 'process-list',
-      content: processContent,
+      const prefix = this.selectedIndex === index ? '▶' : '';
+      
+      const processItem = new TextRenderable(this.renderer, {
+        id: `process-item-${index}`,
+        content: t`${prefix}${fg(processColor)(script.displayName)} ${fg(statusColor)(icon)}`,
+      });
+      processListContainer.add(processItem);
     });
+    
+    this.processListRenderable = processListContainer;
     mainContainer.add(this.processListRenderable);
     currentY++;
     
@@ -821,24 +702,28 @@ class ProcessManager {
     const usedLines = 5;
     const availableHeight = Math.max(10, this.renderer.height - usedLines - 2); // -2 for padding
     
-    // Create scrollable output container
-    if (this.outputScrollBox) {
-      this.outputScrollBox.destroy();
+    // Create output container
+    // Use ScrollBoxRenderable when paused (to allow scrolling), BoxRenderable when not paused
+    if (this.outputBox) {
+      this.outputBox.destroy();
     }
     
-    this.outputScrollBox = new ScrollBoxRenderable(this.renderer, {
-      id: 'output-scrollbox',
-      height: availableHeight,
-      flexGrow: 1,
-      showScrollbar: true,
-      scrollbarOptions: {
-        showArrows: true,
-        trackOptions: {
-          foregroundColor: '#7aa2f7',
-          backgroundColor: '#414868',
-        },
-      },
-    });
+    if (this.isPaused) {
+      // When paused, use ScrollBoxRenderable to allow scrolling through all history
+      this.outputBox = new ScrollBoxRenderable(this.renderer, {
+        id: 'output-box',
+        flexGrow: 1,
+        showScrollbar: true,  // Show scrollbar when paused
+      });
+    } else {
+      // When not paused, use regular BoxRenderable (no scrollbar needed)
+      this.outputBox = new BoxRenderable(this.renderer, {
+        id: 'output-box',
+        flexDirection: 'column',
+        flexGrow: 1,
+        overflow: 'hidden',
+      });
+    }
     
     // Add output lines to scrollbox in reverse order (newest first)
     const filteredLines = this.filter 
@@ -848,20 +733,38 @@ class ProcessManager {
         )
       : this.outputLines;
     
-    // Add lines in reverse order so newest appears at top
-    for (let i = filteredLines.length - 1; i >= 0; i--) {
-      const line = filteredLines[i];
+    // Decide which lines to show
+    let linesToShow;
+    if (this.isPaused) {
+      // When paused, show all lines (scrollable)
+      linesToShow = filteredLines;
+    } else {
+      // When not paused, only show most recent N lines
+      linesToShow = filteredLines.slice(-this.maxVisibleLines);
+    }
+    
+    // Add lines in reverse order (newest first)
+    for (let i = linesToShow.length - 1; i >= 0; i--) {
+      const line = linesToShow[i];
       const processColor = this.processColors.get(line.process) || '#FFFFFF';
+      
+      // Truncate long lines to prevent wrapping (terminal width - prefix length - padding)
+      const maxWidth = Math.max(40, this.renderer.width - line.process.length - 10);
+      const truncatedText = line.text.length > maxWidth 
+        ? line.text.substring(0, maxWidth - 3) + '...' 
+        : line.text;
+      
       const outputLine = new TextRenderable(this.renderer, {
         id: `output-${i}`,
-        content: t`${fg(processColor)(`[${line.process}]`)} ${line.text}`,
+        content: t`${fg(processColor)(`[${line.process}]`)} ${truncatedText}`,
       });
-      this.outputScrollBox.add(outputLine);
+      this.outputBox.add(outputLine);
     }
     
     this.lastRenderedLineCount = filteredLines.length;
+    this.wasPaused = this.isPaused;
     
-    mainContainer.add(this.outputScrollBox);
+    mainContainer.add(this.outputBox);
     
     this.renderer.root.add(mainContainer);
     this.runningContainer = mainContainer;
