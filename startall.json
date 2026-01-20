@@ -1,0 +1,57 @@
+{
+  "defaultSelection": [
+    "test",
+    "demo:worker2",
+    "demo:frontend",
+    "demo:worker",
+    "demo:backend"
+  ],
+  "paneLayout": {
+    "type": "split",
+    "direction": "vertical",
+    "sizes": [
+      1,
+      1
+    ],
+    "children": [
+      {
+        "type": "pane",
+        "processes": [],
+        "hidden": [
+          "demo:worker2",
+          "demo:worker",
+          "demo:backend"
+        ]
+      },
+      {
+        "type": "split",
+        "direction": "horizontal",
+        "sizes": [
+          1,
+          1
+        ],
+        "children": [
+          {
+            "type": "pane",
+            "processes": [],
+            "hidden": [
+              "demo:worker2",
+              "demo:frontend",
+              "test"
+            ]
+          },
+          {
+            "type": "pane",
+            "processes": [],
+            "hidden": [
+              "test",
+              "demo:frontend",
+              "demo:backend",
+              "demo:worker"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

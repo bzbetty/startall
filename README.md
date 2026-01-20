@@ -65,7 +65,7 @@ After starting:
 ## Installation
 
 ```bash
-npm install -g @yourname/start
+npm install -g startall
 ```
 
 ## Usage
@@ -73,7 +73,8 @@ npm install -g @yourname/start
 In any project with a `package.json`:
 
 ```bash
-start
+startall                    # uses startall.json if present
+startall myconfig.json      # uses custom config file
 ```
 
 That's it! The TUI will:
@@ -113,7 +114,17 @@ Existing tools either:
 - Built with [OpenTUI](https://github.com/openmux/opentui) for a modern terminal UI
 - Uses standard Node.js `child_process` (no PTY required = Windows support)
 - Parses `package.json` scripts automatically
-- Saves preferences in `.last-selected-scripts.json`
+- Saves configuration in `startall.json`:
+  ```json
+  {
+    "defaultSelection": ["frontend", "backend"],
+    "include": ["dev:*"],
+    "ignore": ["*:test"]
+  }
+  ```
+  - `include` (optional): if defined, only scripts matching these patterns are shown
+  - `ignore`: scripts matching these patterns are hidden
+  - Both support wildcards (`*`)
 
 ## Roadmap
 
