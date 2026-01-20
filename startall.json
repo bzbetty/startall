@@ -4,7 +4,9 @@
     "demo:worker2",
     "demo:frontend",
     "demo:worker",
-    "demo:backend"
+    "demo:backend",
+    "demo:build",
+    "demo:errors"
   ],
   "paneLayout": {
     "type": "split",
@@ -21,7 +23,9 @@
           "demo:worker2",
           "demo:worker",
           "demo:backend"
-        ]
+        ],
+        "filter": "",
+        "colorFilter": null
       },
       {
         "type": "split",
@@ -34,11 +38,9 @@
           {
             "type": "pane",
             "processes": [],
-            "hidden": [
-              "demo:worker2",
-              "demo:frontend",
-              "test"
-            ]
+            "hidden": [],
+            "filter": "",
+            "colorFilter": "red"
           },
           {
             "type": "pane",
@@ -48,7 +50,9 @@
               "demo:frontend",
               "demo:backend",
               "demo:worker"
-            ]
+            ],
+            "filter": "",
+            "colorFilter": "yellow"
           }
         ]
       }

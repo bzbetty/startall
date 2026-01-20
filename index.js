@@ -12,6 +12,9 @@ const CONFIG_FILE = process.argv[2] || 'startall.json';
 const COUNTDOWN_SECONDS = 10;
 const APP_VERSION = 'v0.0.4';
 
+// Detect if running inside VS Code's integrated terminal
+const IS_VSCODE = process.env.TERM_PROGRAM === 'vscode';
+
 // Pane ID generator
 let paneIdCounter = 0;
 function generatePaneId() {
@@ -26,6 +29,7 @@ function createPane(processes = []) {
     processes: processes, // Array of process names shown in this pane (empty = all)
     hidden: [], // Array of process names to hide from this pane
     filter: '', // Text filter for this pane
+    colorFilter: null, // Color filter: 'red', 'yellow', 'green', 'blue', 'cyan', 'magenta', or null
     isPaused: false,
     scrollOffset: 0,
   };
@@ -65,6 +69,34 @@ function getAllPaneIds(node, ids = []) {
     }
   }
   return ids;
+}
+
+// Get ANSI color codes for a color name (includes normal and bright variants)
+function getAnsiColorCodes(colorName) {
+  const colorMap = {
+    red: [31, 91],      // normal red, bright red
+    yellow: [33, 93],   // normal yellow, bright yellow (warnings)
+    green: [32, 92],    // normal green, bright green
+    blue: [34, 94],     // normal blue, bright blue
+    cyan: [36, 96],     // normal cyan, bright cyan
+    magenta: [35, 95],  // normal magenta, bright magenta
+  };
+  return colorMap[colorName] || [];
+}
+
+// Check if a line contains a specific ANSI color
+function lineHasColor(text, colorName) {
+  const codes = getAnsiColorCodes(colorName);
+  // Match ANSI escape sequences like \x1b[31m, \x1b[91m, \x1b[1;31m, etc.
+  for (const code of codes) {
+    // Check for direct color code: \x1b[31m
+    if (text.includes(`\x1b[${code}m`)) return true;
+    // Check for color with modifiers: \x1b[1;31m, \x1b[0;31m, etc.
+    if (text.includes(`;${code}m`)) return true;
+    // Check for color at start of sequence: \x1b[31;1m
+    if (text.includes(`\x1b[${code};`)) return true;
+  }
+  return false;
 }
 
 // Find parent of a node
@@ -172,6 +204,8 @@ function serializePaneTree(node) {
       type: 'pane',
       processes: node.processes || [],
       hidden: node.hidden || [],
+      filter: node.filter || '',
+      colorFilter: node.colorFilter || null,
     };
   }
   
@@ -190,6 +224,8 @@ function deserializePaneTree(data) {
   if (data.type === 'pane') {
     const pane = createPane(data.processes || []);
     pane.hidden = data.hidden || [];
+    pane.filter = data.filter || '';
+    pane.colorFilter = data.colorFilter || null;
     return pane;
   }
   
@@ -376,8 +412,8 @@ class ProcessManager {
           // Reset countdown when selection changes
           this.countdown = COUNTDOWN_SECONDS;
         }
-      } else if (keyName === 'c') {
-        // Open settings menu
+      } else if (keyName === 'o') {
+        // Open settings menu (options)
         clearInterval(this.countdownInterval);
         this.previousPhase = 'selection';
         this.phase = 'settings';
@@ -416,6 +452,7 @@ class ProcessManager {
       } else {
         // Normal mode - handle commands
         if (keyName === 'q') {
+          this.savePaneLayout();
           this.cleanup();
           this.renderer.destroy();
         } else if (keyName === '\\') {
@@ -491,14 +528,23 @@ class ProcessManager {
           if (scriptName) {
             this.toggleProcess(scriptName);
           }
-        } else if (keyName === 'c') {
-          // Open settings
+        } else if (keyName === 'o') {
+          // Open settings (options)
           this.previousPhase = 'running';
           this.phase = 'settings';
           this.settingsSection = 'ignore';
           this.settingsIndex = 0;
           this.buildSettingsUI();
           return;
+        } else if (keyName === 'c') {
+          // Cycle color filter on focused pane
+          const pane = findPaneById(this.paneRoot, this.focusedPaneId);
+          if (pane) {
+            const colors = [null, 'red', 'yellow', 'green', 'blue', 'cyan', 'magenta'];
+            const currentIndex = colors.indexOf(pane.colorFilter);
+            pane.colorFilter = colors[(currentIndex + 1) % colors.length];
+            this.buildRunningUI();
+          }
         } else if (keyName === 'tab') {
           // Navigate to next pane
           this.navigateToNextPane(1);
@@ -1135,6 +1181,11 @@ class ProcessManager {
       );
     }
     
+    // Apply color filter (filter lines containing specific ANSI color codes)
+    if (pane.colorFilter) {
+      lines = lines.filter(line => lineHasColor(line.text, pane.colorFilter));
+    }
+    
     return lines;
   }
   
@@ -1529,6 +1580,15 @@ class ProcessManager {
     leftSide.add(titleText);
     this.headerText = titleText; // Save reference for countdown updates
     
+    // VS Code hint
+    if (IS_VSCODE) {
+      const vscodeHint = new TextRenderable(this.renderer, {
+        id: 'vscode-hint',
+        content: t`${fg(COLORS.textDim)('(vscode)')}`,
+      });
+      leftSide.add(vscodeHint);
+    }
+    
     footerBar.add(leftSide);
     
     // Right side: shortcuts
@@ -1541,7 +1601,7 @@ class ProcessManager {
     const shortcuts = [
       { key: 'spc', desc: 'sel', color: COLORS.success },
       { key: 'ret', desc: 'go', color: COLORS.accent },
-      { key: 'c', desc: 'cfg', color: COLORS.magenta },
+      { key: 'o', desc: 'cfg', color: COLORS.magenta },
     ];
     
     shortcuts.forEach(({ key, desc, color }) => {
@@ -2026,6 +2086,15 @@ class ProcessManager {
     });
     leftSide.add(statusIndicator);
     
+    // VS Code hint
+    if (IS_VSCODE) {
+      const vscodeHint = new TextRenderable(this.renderer, {
+        id: 'vscode-hint',
+        content: t`${fg(COLORS.textDim)('(vscode)')}`,
+      });
+      leftSide.add(vscodeHint);
+    }
+    
     // Filter indicator if active
     if (this.filter || this.isFilterMode) {
       const filterText = this.isFilterMode ? `/${this.filter}_` : `/${this.filter}`;
@@ -2034,6 +2103,23 @@ class ProcessManager {
         content: t`${fg(COLORS.cyan)(filterText)}`,
       });
       leftSide.add(filterIndicator);
+    }
+    
+    // Color filter indicator if active on focused pane
+    if (focusedPane?.colorFilter) {
+      const colorMap = {
+        red: COLORS.error,
+        yellow: COLORS.warning,
+        green: COLORS.success,
+        blue: COLORS.accent,
+        cyan: COLORS.cyan,
+        magenta: COLORS.magenta,
+      };
+      const colorIndicator = new TextRenderable(this.renderer, {
+        id: 'color-filter-indicator',
+        content: t`${fg(colorMap[focusedPane.colorFilter] || COLORS.text)(`[${focusedPane.colorFilter}]`)}`,
+      });
+      leftSide.add(colorIndicator);
     }
     
     footerBar.add(leftSide);
@@ -2050,6 +2136,7 @@ class ProcessManager {
       { key: 'spc', desc: 'toggle', color: COLORS.success },
       { key: 'p', desc: 'pause', color: COLORS.warning },
       { key: '/', desc: 'filter', color: COLORS.cyan },
+      { key: 'c', desc: 'color', color: COLORS.magenta },
       { key: 's', desc: 'stop', color: COLORS.error },
       { key: 'r', desc: 'restart', color: COLORS.success },
       { key: 'q', desc: 'quit', color: COLORS.error },
