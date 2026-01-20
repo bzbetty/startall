@@ -5,10 +5,11 @@
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node index.js",
-    "demo:frontend": "node -e \"setInterval(() => console.log('[Frontend] Server running...'), 2000)\"",
-    "demo:backend": "node -e \"setInterval(() => console.log('[Backend] API ready...'), 3000)\"",
-    "demo:worker": "node -e \"setInterval(() => console.log('[Worker] Processing jobs...'), 2500)\""
+    "start": "bun index.js",
+    "demo:frontend": "node -e \"setInterval(() => console.log('Server running...'), 200)\"",
+    "demo:backend": "node -e \"setInterval(() => console.log('API ready...  API ready...  API ready...  API ready...  API ready...'), 300)\"",
+    "demo:worker": "node -e \"setInterval(() => console.log('Processing jobs...'), 250)\"",
+    "demo:worker2": "node -e \"setInterval(() => console.log('Processing jobs...'), 250)\""
   },
   "keywords": [],
   "author": "",
