@@ -623,7 +623,10 @@ class ProcessManager {
     
     // Only add new lines that haven't been rendered yet
     const filteredLines = this.filter 
-      ? this.outputLines.filter(line => line.text.toLowerCase().includes(this.filter.toLowerCase()))
+      ? this.outputLines.filter(line => 
+          line.process.toLowerCase().includes(this.filter.toLowerCase()) || 
+          line.text.toLowerCase().includes(this.filter.toLowerCase())
+        )
       : this.outputLines;
     
     // If filter changed, need to rebuild
@@ -839,7 +842,10 @@ class ProcessManager {
     
     // Add output lines to scrollbox in reverse order (newest first)
     const filteredLines = this.filter 
-      ? this.outputLines.filter(line => line.text.toLowerCase().includes(this.filter.toLowerCase()))
+      ? this.outputLines.filter(line => 
+          line.process.toLowerCase().includes(this.filter.toLowerCase()) || 
+          line.text.toLowerCase().includes(this.filter.toLowerCase())
+        )
       : this.outputLines;
     
     // Add lines in reverse order so newest appears at top

@@ -6,10 +6,10 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "bun index.js",
-    "demo:frontend": "node -e \"setInterval(() => console.log('Server running...'), 200)\"",
-    "demo:backend": "node -e \"setInterval(() => console.log('API ready...  API ready...  API ready...  API ready...  API ready...'), 300)\"",
-    "demo:worker": "node -e \"setInterval(() => console.log('Processing jobs...'), 250)\"",
-    "demo:worker2": "node -e \"setInterval(() => console.log('Processing jobs...'), 250)\""
+    "demo:frontend": "node -e \"setInterval(() => console.log('Server running...'), 1000)\"",
+    "demo:backend": "node -e \"setInterval(() => console.log('API ready...  API ready...  API ready...  API ready...  API ready...'), 600)\"",
+    "demo:worker": "node -e \"setInterval(() => console.log('Processing jobs...'), 500)\"",
+    "demo:worker2": "node -e \"setInterval(() => console.log('Processing jobs...'), 100)\""
   },
   "keywords": [],
   "author": "",
