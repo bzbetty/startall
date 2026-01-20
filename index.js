@@ -178,7 +178,7 @@ class ProcessManager {
             this.outputScrollBox.focus();
           } else {
             this.selectedIndex = Math.max(0, this.selectedIndex - 1);
-            this.updateRunningHeader(); // Update only header and process list
+            this.buildRunningUI(); // Rebuild to show selection change
           }
         } else if (keyName === 'down' || keyName === 'j') {
           if (this.isPaused && this.outputScrollBox) {
@@ -186,16 +186,16 @@ class ProcessManager {
             this.outputScrollBox.focus();
           } else {
             this.selectedIndex = Math.min(this.scripts.length - 1, this.selectedIndex + 1);
-            this.updateRunningHeader(); // Update only header and process list
+            this.buildRunningUI(); // Rebuild to show selection change
           }
         } else if (keyName === 'left' || keyName === 'h') {
           // Navigate processes left
           this.selectedIndex = Math.max(0, this.selectedIndex - 1);
-          this.updateRunningHeader(); // Update only header and process list
+          this.buildRunningUI(); // Rebuild to show selection change
         } else if (keyName === 'right' || keyName === 'l') {
           // Navigate processes right
           this.selectedIndex = Math.min(this.scripts.length - 1, this.selectedIndex + 1);
-          this.updateRunningHeader(); // Update only header and process list
+          this.buildRunningUI(); // Rebuild to show selection change
         } else if (keyName === 'pageup') {
           // Page up in output
           if (this.outputScrollBox) {
@@ -519,11 +519,11 @@ class ProcessManager {
   
   updateRunningHeader() {
     // Update only the header and process list without rebuilding everything
-    if (!this.headerRenderable || !this.processListRenderable) {
+    if (!this.headerRenderable || !this.processListRenderable || !this.runningContainer) {
       return;
     }
     
-    // Update header
+    // Update header (plain text works)
     const selectedScript = this.scripts[this.selectedIndex];
     const selectedName = selectedScript ? selectedScript.displayName : '';
     const pauseIndicator = this.isPaused ? ' [PAUSED]' : '';
@@ -534,15 +534,84 @@ class ProcessManager {
       this.headerRenderable.setContent(headerText);
     }
     
-    // Update process list
-    const processContent = this.getProcessListContent();
+    // For process list with styled text, we need to recreate it
+    // Remove old one
+    this.runningContainer.remove(this.processListRenderable);
+    this.processListRenderable.destroy();
     
-    if (this.processListRenderable.setContent) {
-      this.processListRenderable.setContent(processContent);
+    // Create new process list with current selection
+    let processContent;
+    if (this.scripts.length === 1) {
+      const script = this.scripts[0];
+      const proc = this.processes.get(script.name);
+      const status = proc?.status || 'stopped';
+      const statusIcon = status === 'running' ? '●' : status === 'crashed' ? '✖' : '○';
+      const statusColor = status === 'running' ? '#00FF00' : status === 'crashed' ? '#FF0000' : '#666666';
+      const processColor = this.processColors.get(script.name) || '#FFFFFF';
+      processContent = t`▶${fg(processColor)(script.displayName)} ${fg(statusColor)(statusIcon)}`;
+    } else if (this.scripts.length === 2) {
+      const s0 = this.scripts[0];
+      const s1 = this.scripts[1];
+      const proc0 = this.processes.get(s0.name);
+      const proc1 = this.processes.get(s1.name);
+      const status0 = proc0?.status || 'stopped';
+      const status1 = proc1?.status || 'stopped';
+      const icon0 = status0 === 'running' ? '●' : status0 === 'crashed' ? '✖' : '○';
+      const icon1 = status1 === 'running' ? '●' : status1 === 'crashed' ? '✖' : '○';
+      const color0 = status0 === 'running' ? '#00FF00' : status0 === 'crashed' ? '#FF0000' : '#666666';
+      const color1 = status1 === 'running' ? '#00FF00' : status1 === 'crashed' ? '#FF0000' : '#666666';
+      const pcolor0 = this.processColors.get(s0.name) || '#FFFFFF';
+      const pcolor1 = this.processColors.get(s1.name) || '#FFFFFF';
+      const prefix0 = this.selectedIndex === 0 ? '▶' : '';
+      const prefix1 = this.selectedIndex === 1 ? '▶' : '';
+      processContent = t`${prefix0}${fg(pcolor0)(s0.displayName)} ${fg(color0)(icon0)}  ${prefix1}${fg(pcolor1)(s1.displayName)} ${fg(color1)(icon1)}`;
+    } else if (this.scripts.length === 3) {
+      const s0 = this.scripts[0];
+      const s1 = this.scripts[1];
+      const s2 = this.scripts[2];
+      const proc0 = this.processes.get(s0.name);
+      const proc1 = this.processes.get(s1.name);
+      const proc2 = this.processes.get(s2.name);
+      const status0 = proc0?.status || 'stopped';
+      const status1 = proc1?.status || 'stopped';
+      const status2 = proc2?.status || 'stopped';
+      const icon0 = status0 === 'running' ? '●' : status0 === 'crashed' ? '✖' : '○';
+      const icon1 = status1 === 'running' ? '●' : status1 === 'crashed' ? '✖' : '○';
+      const icon2 = status2 === 'running' ? '●' : status2 === 'crashed' ? '✖' : '○';
+      const color0 = status0 === 'running' ? '#00FF00' : status0 === 'crashed' ? '#FF0000' : '#666666';
+      const color1 = status1 === 'running' ? '#00FF00' : status1 === 'crashed' ? '#FF0000' : '#666666';
+      const color2 = status2 === 'running' ? '#00FF00' : status2 === 'crashed' ? '#FF0000' : '#666666';
+      const pcolor0 = this.processColors.get(s0.name) || '#FFFFFF';
+      const pcolor1 = this.processColors.get(s1.name) || '#FFFFFF';
+      const pcolor2 = this.processColors.get(s2.name) || '#FFFFFF';
+      const prefix0 = this.selectedIndex === 0 ? '▶' : '';
+      const prefix1 = this.selectedIndex === 1 ? '▶' : '';
+      const prefix2 = this.selectedIndex === 2 ? '▶' : '';
+      processContent = t`${prefix0}${fg(pcolor0)(s0.displayName)} ${fg(color0)(icon0)}  ${prefix1}${fg(pcolor1)(s1.displayName)} ${fg(color1)(icon1)}  ${prefix2}${fg(pcolor2)(s2.displayName)} ${fg(color2)(icon2)}`;
+    } else {
+      // 4+ processes - for now hardcode to 4, but should be dynamic
+      const parts = this.scripts.slice(0, 4).map((script, idx) => {
+        const proc = this.processes.get(script.name);
+        const status = proc?.status || 'stopped';
+        const icon = status === 'running' ? '●' : status === 'crashed' ? '✖' : '○';
+        const color = status === 'running' ? '#00FF00' : status === 'crashed' ? '#FF0000' : '#666666';
+        const pcolor = this.processColors.get(script.name) || '#FFFFFF';
+        const prefix = this.selectedIndex === idx ? '▶' : '';
+        return { prefix, name: script.displayName, icon, color, pcolor };
+      });
+      processContent = t`${parts[0].prefix}${fg(parts[0].pcolor)(parts[0].name)} ${fg(parts[0].color)(parts[0].icon)}  ${parts[1].prefix}${fg(parts[1].pcolor)(parts[1].name)} ${fg(parts[1].color)(parts[1].icon)}  ${parts[2].prefix}${fg(parts[2].pcolor)(parts[2].name)} ${fg(parts[2].color)(parts[2].icon)}  ${parts[3].prefix}${fg(parts[3].pcolor)(parts[3].name)} ${fg(parts[3].color)(parts[3].icon)}`;
     }
     
-    // Request a re-render to show the changes
-    this.renderer.requestRender();
+    // Create new process list renderable
+    this.processListRenderable = new TextRenderable(this.renderer, {
+      id: 'process-list',
+      content: processContent,
+    });
+    
+    // Insert it back in the right position (after header and spacer)
+    // This is tricky - we need to insert at position 2
+    // For now, just rebuild the whole UI since we can't easily insert
+    this.buildRunningUI();
   }
   
   updateRunningUI() {
@@ -565,24 +634,30 @@ class ProcessManager {
       return;
     }
     
-    // Add only new lines (in reverse order - newest first)
-    const newLines = filteredLines.slice(this.lastRenderedLineCount);
-    // Insert at the beginning in reverse order so newest is at top
-    for (let i = newLines.length - 1; i >= 0; i--) {
-      const line = newLines[i];
-      const processColor = this.processColors.get(line.process) || '#FFFFFF';
-      const outputLine = new TextRenderable(this.renderer, {
-        id: `output-${this.lastRenderedLineCount + i}`,
-        content: t`${fg(processColor)(`[${line.process}]`)} ${line.text}`,
-      });
-      // Insert at beginning instead of end
-      if (this.outputScrollBox.children && this.outputScrollBox.children.length > 0) {
-        // Insert at position 0
-        const firstChild = this.outputScrollBox.children[0];
-        this.outputScrollBox.insertBefore(outputLine, firstChild);
-      } else {
+    // For reverse order, we need to rebuild the entire scrollbox
+    // Clear and re-add all lines in reverse order
+    // Only do this if we have new lines
+    const newLineCount = filteredLines.length - this.lastRenderedLineCount;
+    if (newLineCount > 0) {
+      // Clear all existing output
+      while (this.outputScrollBox.children && this.outputScrollBox.children.length > 0) {
+        const child = this.outputScrollBox.children[0];
+        this.outputScrollBox.remove(child);
+        child.destroy();
+      }
+      
+      // Add all lines in reverse order (newest first)
+      for (let i = filteredLines.length - 1; i >= 0; i--) {
+        const line = filteredLines[i];
+        const processColor = this.processColors.get(line.process) || '#FFFFFF';
+        const outputLine = new TextRenderable(this.renderer, {
+          id: `output-${i}`,
+          content: t`${fg(processColor)(`[${line.process}]`)} ${line.text}`,
+        });
         this.outputScrollBox.add(outputLine);
       }
+      
+      this.lastRenderedLineCount = filteredLines.length;
     }
     
     this.lastRenderedLineCount = currentFilteredCount;
