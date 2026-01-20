@@ -26,6 +26,7 @@ function createPane(processes = []) {
   return {
     type: 'pane',
     id: generatePaneId(),
+    name: '', // Custom name for the pane
     processes: processes, // Array of process names shown in this pane (empty = all)
     hidden: [], // Array of process names to hide from this pane
     filter: '', // Text filter for this pane
@@ -202,6 +203,7 @@ function serializePaneTree(node) {
   if (node.type === 'pane') {
     return {
       type: 'pane',
+      name: node.name || '',
       processes: node.processes || [],
       hidden: node.hidden || [],
       filter: node.filter || '',
@@ -223,6 +225,7 @@ function deserializePaneTree(data) {
   
   if (data.type === 'pane') {
     const pane = createPane(data.processes || []);
+    pane.name = data.name || '';
     pane.hidden = data.hidden || [];
     pane.filter = data.filter || '';
     pane.colorFilter = data.colorFilter || null;
@@ -331,6 +334,8 @@ class ProcessManager {
     this.isPaused = false;  // Whether output scrolling is paused
     this.wasPaused = false;  // Track previous pause state to detect changes
     this.isFilterMode = false;  // Whether in filter input mode
+    this.isNamingMode = false;  // Whether in pane naming input mode
+    this.namingModeText = '';  // Text being typed for pane name
     
     // Settings menu state
     this.settingsSection = 'ignore';  // 'ignore' | 'include' | 'scripts'
@@ -432,8 +437,31 @@ class ProcessManager {
         return;
       }
       
+      // If in naming mode, handle name input
+      if (this.isNamingMode) {
+        const pane = findPaneById(this.paneRoot, this.focusedPaneId);
+        if (keyName === 'escape') {
+          this.isNamingMode = false;
+          this.namingModeText = '';
+          this.buildRunningUI(); // Rebuild to cancel naming
+        } else if (keyName === 'enter' || keyName === 'return') {
+          if (pane) {
+            pane.name = this.namingModeText;
+            this.savePaneLayout(); // Save the new name
+          }
+          this.isNamingMode = false;
+          this.namingModeText = '';
+          this.buildRunningUI(); // Rebuild with new name
+        } else if (keyName === 'backspace') {
+          this.namingModeText = this.namingModeText.slice(0, -1);
+          this.buildRunningUI(); // Update UI to show name change
+        } else if (keyName && keyName.length === 1 && !keyEvent.ctrl && !keyEvent.meta) {
+          this.namingModeText += keyName;
+          this.buildRunningUI(); // Update UI to show name change
+        }
+      }
       // If in filter mode, handle filter input
-      if (this.isFilterMode) {
+      else if (this.isFilterMode) {
         const pane = findPaneById(this.paneRoot, this.focusedPaneId);
         if (keyName === 'escape') {
           this.isFilterMode = false;
@@ -494,6 +522,12 @@ class ProcessManager {
           this.isFilterMode = true;
           const pane = findPaneById(this.paneRoot, this.focusedPaneId);
           if (pane) pane.filter = '';
+        } else if (keyName === 'n') {
+          // Enter naming mode for focused pane
+          this.isNamingMode = true;
+          const pane = findPaneById(this.paneRoot, this.focusedPaneId);
+          this.namingModeText = pane?.name || '';
+          this.buildRunningUI(); // Rebuild to show naming input
         } else if (keyName === 'escape') {
           // Clear filter on focused pane
           const pane = findPaneById(this.paneRoot, this.focusedPaneId);
@@ -1791,6 +1825,10 @@ class ProcessManager {
     const outputHeight = Math.max(3, height - 2);
     let linesToShow = this.isPaused ? lines : lines.slice(-outputHeight);
     
+    // Use full terminal width for padding - simpler and ensures complete clearing
+    // Each pane will pad to full width, excess will be clipped by container
+    const approxPaneWidth = this.renderer.width;
+    
     // Add lines in reverse order (newest first)
     for (let i = linesToShow.length - 1; i >= 0; i--) {
       const line = linesToShow[i];
@@ -1828,11 +1866,44 @@ class ProcessManager {
         truncatedText = result + '\x1b[0m...';
       }
       
+      // Get visible length of current line and pad to fill width
+      const linePrefix = `[${line.process}] `;
+      const currentLength = linePrefix.length + stripAnsi(truncatedText).length;
+      
+      // Pad with spaces to fill the width
+      const paddingNeeded = Math.max(0, approxPaneWidth - currentLength);
+      const padding = ' '.repeat(paddingNeeded);
+      
       const outputLine = new TextRenderable(this.renderer, {
         id: `output-${pane.id}-${i}`,
-        content: t`${fg(processColor)(`[${line.process}]`)} ${truncatedText}`,
+        content: t`${fg(processColor)(`[${line.process}]`)} ${truncatedText}${padding}`,
       });
+      
       container.add(outputLine);
+    }
+    
+    // Fill remaining vertical space with blank lines
+    const emptyLinesNeeded = Math.max(0, outputHeight - linesToShow.length);
+    for (let j = 0; j < emptyLinesNeeded; j++) {
+      const emptyLine = new TextRenderable(this.renderer, {
+        id: `empty-${pane.id}-${j}`,
+        content: ' '.repeat(approxPaneWidth), // Fill entire width with spaces
+      });
+      
+      container.add(emptyLine);
+    }
+  }
+  
+  // Count how many vertical panes exist (for width calculation)
+  countVerticalPanes(node) {
+    if (!node) return 1;
+    if (node.type === 'pane') return 1;
+    if (node.direction === 'vertical') {
+      // Vertical split means panes side by side
+      return node.children.reduce((sum, child) => sum + this.countVerticalPanes(child), 0);
+    } else {
+      // Horizontal split means panes stacked, count the max
+      return Math.max(...node.children.map(child => this.countVerticalPanes(child)));
     }
   }
   
@@ -1841,21 +1912,25 @@ class ProcessManager {
     const isFocused = pane.id === this.focusedPaneId;
     const borderColor = isFocused ? COLORS.borderFocused : COLORS.border;
     
-    // Title shows assigned processes or "All", plus filter and hidden count
-    const processLabel = pane.processes.length > 0 
+    // Title shows custom name (if set), or assigned processes or "All", plus filter and hidden count
+    const customName = pane.name ? pane.name : null;
+    const processLabel = customName || (pane.processes.length > 0 
       ? pane.processes.join(', ')
-      : 'All';
+      : 'All');
     const focusLabel = isFocused ? '*' : '';
     const hiddenCount = pane.hidden?.length || 0;
     const hiddenLabel = hiddenCount > 0 ? ` -${hiddenCount}` : '';
     const filterLabel = pane.filter ? ` /${pane.filter}` : '';
+    const namingInputLabel = (isFocused && this.isNamingMode) ? `Name: ${this.namingModeText}_` : '';
     const filterInputLabel = (isFocused && this.isFilterMode) ? `/${pane.filter || ''}_` : '';
-    const title = ` ${focusLabel}${processLabel}${hiddenLabel}${filterInputLabel || filterLabel} `;
+    const title = ` ${focusLabel}${namingInputLabel || processLabel}${hiddenLabel}${filterInputLabel || filterLabel} `;
     
     const paneContainer = new BoxRenderable(this.renderer, {
       id: `pane-${pane.id}`,
       flexDirection: 'column',
       flexGrow: flexGrow,
+      flexShrink: 0, // Prevent shrinking - maintain 50/50 split
+      flexBasis: 0, // Use flexGrow ratio for sizing, not content size
       border: true,
       borderStyle: 'rounded',
       borderColor: borderColor,
@@ -1863,19 +1938,25 @@ class ProcessManager {
       titleAlignment: 'left',
       padding: 0,
       overflow: 'hidden',
+      backgroundColor: COLORS.bg,
     });
     
-    // Output content - always use BoxRenderable for consistent sizing
+    // Output content - use BoxRenderable that fills remaining space
+    // Use passed height or calculate default for line count calculation
+    const height = availableHeight ? Math.max(5, availableHeight - 2) : Math.max(5, this.renderer.height - 6);
+    
     const outputBox = new BoxRenderable(this.renderer, {
       id: `pane-output-${pane.id}`,
       flexDirection: 'column',
       flexGrow: 1,
+      flexShrink: 1,
+      flexBasis: 0,
+      width: '100%',
       overflow: 'hidden',
       paddingLeft: 1,
+      backgroundColor: COLORS.bg,
     });
     
-    // Use passed height or calculate default
-    const height = availableHeight ? Math.max(5, availableHeight - 2) : Math.max(5, this.renderer.height - 6);
     this.buildPaneOutput(pane, outputBox, height);
     
     paneContainer.add(outputBox);
@@ -1900,6 +1981,8 @@ class ProcessManager {
       id: `split-${node.direction}`,
       flexDirection: node.direction === 'vertical' ? 'row' : 'column',
       flexGrow: flexGrow,
+      flexShrink: 0,
+      flexBasis: 0,
       gap: 0,
     });
     
@@ -2049,6 +2132,8 @@ class ProcessManager {
       id: 'pane-area',
       flexDirection: 'column',
       flexGrow: 1,
+      flexShrink: 0,
+      flexBasis: 0,
       backgroundColor: COLORS.bg,
     });
     
@@ -2134,6 +2219,7 @@ class ProcessManager {
     const shortcuts = [
       { key: '\\', desc: 'panes', color: COLORS.cyan },
       { key: 'spc', desc: 'toggle', color: COLORS.success },
+      { key: 'n', desc: 'name', color: COLORS.accent },
       { key: 'p', desc: 'pause', color: COLORS.warning },
       { key: '/', desc: 'filter', color: COLORS.cyan },
       { key: 'c', desc: 'color', color: COLORS.magenta },

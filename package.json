@@ -16,7 +16,7 @@
     "demo:errors": "node -e \"setInterval(() => { console.log('\\x1b[32mOK: All good\\x1b[0m'); console.log('\\x1b[33mWARN: Deprecated API used\\x1b[0m'); console.log('\\x1b[31mERROR: Connection failed\\x1b[0m'); console.log('Normal log message'); }, 2000)\"",
     "demo:build": "node -e \"let i=0; setInterval(() => { i++; if(i%5===0) console.log('\\x1b[31mError: Type mismatch in file.ts:42\\x1b[0m'); else if(i%3===0) console.log('\\x1b[33mWarning: Unused variable\\x1b[0m'); else console.log('\\x1b[36mCompiling module ' + i + '...\\x1b[0m'); }, 800)\""
   },
-"keywords": [],
+  "keywords": [],
   "author": "",
   "license": "ISC",
   "repository": {

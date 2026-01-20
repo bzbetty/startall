@@ -12,18 +12,28 @@
     "type": "split",
     "direction": "vertical",
     "sizes": [
-      1,
+      0.5,
+      0.5,
       1
     ],
     "children": [
       {
         "type": "pane",
+        "name": "namedcontainer",
         "processes": [],
         "hidden": [
           "demo:worker2",
           "demo:worker",
           "demo:backend"
         ],
+        "filter": "",
+        "colorFilter": null
+      },
+      {
+        "type": "pane",
+        "name": "",
+        "processes": [],
+        "hidden": [],
         "filter": "",
         "colorFilter": null
       },
@@ -37,6 +47,7 @@
         "children": [
           {
             "type": "pane",
+            "name": "",
             "processes": [],
             "hidden": [],
             "filter": "",
@@ -44,6 +55,7 @@
           },
           {
             "type": "pane",
+            "name": "",
             "processes": [],
             "hidden": [
               "test",
