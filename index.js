@@ -1877,6 +1877,7 @@ class ProcessManager {
       const outputLine = new TextRenderable(this.renderer, {
         id: `output-${pane.id}-${i}`,
         content: t`${fg(processColor)(`[${line.process}]`)} ${truncatedText}${padding}`,
+        bg: '#000000', // Black background for pane content
       });
       
       container.add(outputLine);
@@ -1888,6 +1889,7 @@ class ProcessManager {
       const emptyLine = new TextRenderable(this.renderer, {
         id: `empty-${pane.id}-${j}`,
         content: ' '.repeat(approxPaneWidth), // Fill entire width with spaces
+        bg: '#000000', // Black background for empty lines
       });
       
       container.add(emptyLine);
@@ -1938,7 +1940,7 @@ class ProcessManager {
       titleAlignment: 'left',
       padding: 0,
       overflow: 'hidden',
-      backgroundColor: COLORS.bg,
+      backgroundColor: '#000000', // Black background for pane container
     });
     
     // Output content - use BoxRenderable that fills remaining space
@@ -1951,10 +1953,9 @@ class ProcessManager {
       flexGrow: 1,
       flexShrink: 1,
       flexBasis: 0,
-      width: '100%',
       overflow: 'hidden',
       paddingLeft: 1,
-      backgroundColor: COLORS.bg,
+      backgroundColor: '#000000', // Black background for pane
     });
     
     this.buildPaneOutput(pane, outputBox, height);
@@ -2074,13 +2075,13 @@ class ProcessManager {
     // Clear outputBox reference since it was destroyed with runningContainer
     this.outputBox = null;
     
-    // Create main container - full screen with dark background
+    // Create main container - full screen with black background
     const mainContainer = new BoxRenderable(this.renderer, {
       id: 'running-container',
       flexDirection: 'column',
       width: '100%',
       height: '100%',
-      backgroundColor: COLORS.bg,
+      backgroundColor: '#000000',
     });
     
     // Process tabs at top
@@ -2134,7 +2135,7 @@ class ProcessManager {
       flexGrow: 1,
       flexShrink: 0,
       flexBasis: 0,
-      backgroundColor: COLORS.bg,
+      backgroundColor: '#000000',
     });
     
     const paneLayout = this.buildPaneLayout(this.paneRoot);
