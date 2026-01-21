@@ -3011,6 +3011,7 @@ class ProcessManager {
     
     const shortcuts = [
       { key: '\\', desc: 'panes', color: COLORS.cyan },
+      { key: 'e', desc: 'execute', color: COLORS.warning },
       { key: '1-9', desc: 'toggle', color: COLORS.success },
       { key: 'i', desc: 'input', color: COLORS.success },
       { key: 'n', desc: 'name', color: COLORS.accent },
@@ -3022,6 +3023,19 @@ class ProcessManager {
       { key: 'o', desc: 'settings', color: COLORS.magenta },
       { key: 'q', desc: 'quit', color: COLORS.error },
     ];
+    
+    // Add configured quick command shortcuts
+    const configShortcuts = this.config.shortcuts || {};
+    for (const [key, scriptName] of Object.entries(configShortcuts)) {
+      // Show first 3 shortcuts to avoid cluttering footer
+      if (Object.keys(configShortcuts).length <= 3 || shortcuts.length < 15) {
+        const script = this.allScripts.find(s => s.name === scriptName);
+        if (script) {
+          const shortDesc = script.displayName.length > 8 ? script.displayName.substring(0, 6) + '..' : script.displayName;
+          shortcuts.splice(2, 0, { key, desc: shortDesc, color: this.processColors.get(script.name) || COLORS.text });
+        }
+      }
+    }
     
     shortcuts.forEach(({ key, desc, color }) => {
       const shortcut = new TextRenderable(this.renderer, {
