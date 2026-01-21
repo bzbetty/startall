@@ -1,6 +1,8 @@
-# 🚀 Start
+# 🚀 startall
 
-> An interactive terminal UI for managing multiple npm scripts in parallel
+> A powerful, interactive terminal UI for managing multiple npm scripts with tmux-style panes, filtering, and real-time control
+
+![startall screenshot](https://github.com/bzbetty/startall/raw/main/screenshot.png)
 
 ## The Problem
 
@@ -20,47 +22,47 @@ Traditional solutions fall short:
 
 ## The Solution
 
-**Start** is a lightweight, interactive TUI that gives you complete control over your development processes:
-
-```
-┌─ Starting in 7s... [Enter to start now] ─────────────┐
-│ [x] frontend (npm run start:frontend)                │
-│ [x] backend (npm run start:backend)                  │
-│ [ ] worker (npm run start:worker)                    │
-│ [x] db (npm run start:db)                            │
-│                                                       │
-│ ↑/↓ Navigate | Space: Toggle | Enter: Start          │
-└───────────────────────────────────────────────────────┘
-
-After starting:
-┌─ Processes ──────────────┬─ Output (filter: error) ───┐
-│ [f] frontend ● Running   │ [backend] Error: ECONNREF  │
-│ [b] backend  ✖ Crashed   │ [backend] Retrying...      │
-│ [w] worker   ⏸ Stopped   │ [frontend] Started on 3000 │
-│ [d] db       ● Running   │                            │
-│                          │                            │
-│ Space: Start/Stop        │                            │
-│ r: Restart               │                            │
-│ /: Filter output         │                            │
-└──────────────────────────┴────────────────────────────┘
-```
+**startall** is a sophisticated TUI that combines the power of tmux with the simplicity of npm scripts, giving you complete control over your development processes with split panes, filtering, and interactive controls.
 
 ## Features
 
-### ✅ Current
-- **Auto-discovery**: Reads all scripts from `package.json` automatically
-- **Smart defaults**: Remembers your last selection
-- **10-second countdown**: Time to review/change selections before starting
+### 🎯 Core Features
+- **Auto-discovery**: Automatically reads all scripts from `package.json`
+- **Smart defaults**: Remembers your last selection in `startall.json`
+- **10-second countdown**: Review selections before starting
 - **Parallel execution**: Run multiple npm scripts simultaneously
-- **Colored output**: Each process gets its own color prefix
-
-### 🚧 Planned
-- **Live status monitoring**: See which processes are running/crashed/stopped at a glance
-- **Interactive controls**: Start, stop, and restart individual processes with keyboard shortcuts
-- **Output filtering**: Search/filter logs across all processes in real-time
+- **Live status monitoring**: Real-time status indicators (● running, ✖ crashed, ○ stopped)
+- **Interactive controls**: Start, stop, and restart individual processes on the fly
 - **Cross-platform**: Works identically on Windows, Linux, and macOS
-- **Tab view**: Switch between different process outputs
-- **Resource monitoring**: CPU/memory usage per process
+
+### 🎨 Advanced UI
+- **Multi-pane layout**: tmux-inspired split panes (vertical & horizontal)
+- **Flexible filtering**: 
+  - Text search across all output (`/`)
+  - Filter by ANSI color (red/yellow/green/blue/cyan/magenta) (`c`)
+  - Per-process visibility toggles (`Space` or `1-9`)
+  - Per-pane filters (different views in each pane)
+- **Custom pane naming**: Label panes for easier identification (`n`)
+- **Persistent layouts**: Your pane configuration is saved between sessions
+- **Process-specific views**: Show/hide specific processes in each pane
+- **Colored output**: Each process gets unique color-coded output
+- **Pause/resume**: Freeze output to review logs (`p`)
+- **Scrollable history**: 1000-line buffer with mouse wheel support
+- **Enhanced navigation**: Home/End/PageUp/PageDown keys
+
+### ⚙️ Display Options
+- **Toggleable line numbers**: Show/hide line numbers (`#`)
+- **Timestamps**: Show/hide timestamps for each log line (`t`)
+- **Quick process toggle**: Use number keys `1-9` for instant visibility control
+
+### 🔧 Advanced Controls
+- **Interactive input mode**: Send commands to running processes via stdin (`i`)
+  - Perfect for dev servers that accept commands (Vite, Rust watch, etc.)
+- **Settings panel**: Configure ignore/include patterns (`o`)
+  - Wildcard support (`*`) for pattern matching
+  - Per-script visibility toggles
+- **Keyboard & mouse support**: Full keyboard navigation + mouse clicking/scrolling
+- **VSCode integration**: Optimized for VSCode integrated terminal
 
 ## Installation
 
@@ -90,14 +92,57 @@ That's it! The TUI will:
 - `↑`/`↓` - Navigate scripts
 - `Space` - Toggle selection
 - `Enter` - Start immediately (skip countdown)
+- `o` - Open settings
 - `Ctrl+C` - Exit
 
-**Running Screen (planned):**
-- `Space` - Start/stop selected process
+**Running Screen:**
+
+*Process Control:*
+- `1-9` - Quick toggle process visibility in focused pane
+- `Space` - Toggle visibility of selected process
+- `s` - Stop/start selected process
 - `r` - Restart selected process
-- `/` - Filter output
-- `Tab` - Switch between processes
-- `Ctrl+C` - Stop all and exit
+- `i` - Send input to selected process (interactive mode)
+
+*Pane Management:*
+- `\` - Open command palette
+- `|` - Split pane vertically (left/right)
+- `_` - Split pane horizontally (top/bottom)
+- `x` - Close current pane (if >1 pane exists)
+- `Tab` - Next pane
+- `Shift+Tab` - Previous pane
+- `n` - Name current pane
+
+*Filtering & View:*
+- `/` - Enter text filter mode
+- `c` - Cycle color filter (red/yellow/green/blue/cyan/magenta/none)
+- `f` - Filter to selected process only
+- `Esc` - Clear filters
+- `p` - Pause/resume output scrolling
+- `#` - Toggle line numbers
+- `t` - Toggle timestamps
+
+*Navigation:*
+- `↑`/`↓` or `k`/`j` - Select process (vim-style)
+- `←`/`→` or `h`/`l` - Select process (vim-style)
+- `Home` - Scroll to top of pane
+- `End` - Scroll to bottom of pane
+- `Page Up` - Scroll up one page
+- `Page Down` - Scroll down one page
+- `Mouse wheel` - Scroll output
+
+*Other:*
+- `o` - Open settings
+- `q` - Quit (stops all processes)
+- `Ctrl+C` - Force quit
+
+**Settings Screen:**
+- `Tab`/`←`/`→` - Switch sections (Ignore/Include/Scripts)
+- `↑`/`↓` - Navigate items
+- `a` - Add new pattern (Ignore/Include sections)
+- `d` or `Backspace` - Delete pattern
+- `Space` or `Enter` - Toggle script (Scripts section)
+- `Esc` or `q` - Return to previous screen
 
 ## Why Build This?
 

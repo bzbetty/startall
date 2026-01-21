@@ -15,6 +15,16 @@ const APP_VERSION = 'v0.0.4';
 // Detect if running inside VS Code's integrated terminal
 const IS_VSCODE = process.env.TERM_PROGRAM === 'vscode';
 
+// VSCode-specific optimizations
+const VSCODE_CONFIG = {
+  // VSCode terminal has better mouse support
+  enhancedMouse: IS_VSCODE,
+  // VSCode can detect and linkify file paths (file:///path/to/file.js:line:col)
+  fileLinking: IS_VSCODE,
+  // Some key combinations are captured by VSCode
+  remapKeys: IS_VSCODE,
+};
+
 // Pane ID generator
 let paneIdCounter = 0;
 function generatePaneId() {
@@ -337,9 +347,13 @@ class ProcessManager {
     this.isFilterMode = false;  // Whether in filter input mode
     this.isNamingMode = false;  // Whether in pane naming input mode
     this.namingModeText = '';  // Text being typed for pane name
+    this.showLineNumbers = this.config.showLineNumbers !== undefined ? this.config.showLineNumbers : true;  // Whether to show line numbers
+    this.showTimestamps = this.config.showTimestamps !== undefined ? this.config.showTimestamps : false;  // Whether to show timestamps
+    this.isInputMode = false;  // Whether in stdin input mode
+    this.inputModeText = '';  // Text being typed for stdin
     
     // Settings menu state
-    this.settingsSection = 'ignore';  // 'ignore' | 'include' | 'scripts'
+    this.settingsSection = 'display';  // 'display' | 'ignore' | 'include' | 'scripts'
     this.settingsIndex = 0;  // Current selection index within section
     this.isAddingPattern = false;  // Whether typing a new pattern
     this.newPatternText = '';  // Text being typed for new pattern
@@ -427,10 +441,25 @@ class ProcessManager {
         clearInterval(this.countdownInterval);
         this.previousPhase = 'selection';
         this.phase = 'settings';
-        this.settingsSection = 'ignore';
+        this.settingsSection = 'display';
         this.settingsIndex = 0;
         this.buildSettingsUI();
         return;
+      } else if (keyName >= '1' && keyName <= '9') {
+        // Toggle script by number (1-9)
+        const index = parseInt(keyName) - 1;
+        if (index >= 0 && index < this.scripts.length) {
+          const scriptName = this.scripts[index]?.name;
+          if (scriptName) {
+            if (this.selectedScripts.has(scriptName)) {
+              this.selectedScripts.delete(scriptName);
+            } else {
+              this.selectedScripts.add(scriptName);
+            }
+            // Reset countdown when selection changes
+            this.countdown = COUNTDOWN_SECONDS;
+          }
+        }
       }
     } else if (this.phase === 'settings') {
       this.handleSettingsInput(keyName, keyEvent);
@@ -442,8 +471,34 @@ class ProcessManager {
         return;
       }
       
+      // If in input mode (stdin), handle stdin input
+      if (this.isInputMode) {
+        const scriptName = this.scripts[this.selectedIndex]?.name;
+        if (keyName === 'escape') {
+          this.isInputMode = false;
+          this.inputModeText = '';
+          this.buildRunningUI();
+        } else if (keyName === 'enter' || keyName === 'return') {
+          // Send the input to the selected process
+          if (scriptName && this.inputModeText.trim()) {
+            this.sendInputToProcess(scriptName, this.inputModeText + '\n');
+          }
+          this.isInputMode = false;
+          this.inputModeText = '';
+          this.buildRunningUI();
+        } else if (keyName === 'backspace') {
+          this.inputModeText = this.inputModeText.slice(0, -1);
+          this.buildRunningUI();
+        } else if (keyName === 'space') {
+          this.inputModeText += ' ';
+          this.buildRunningUI();
+        } else if (keyName && keyName.length === 1 && !keyEvent.ctrl && !keyEvent.meta) {
+          this.inputModeText += keyName;
+          this.buildRunningUI();
+        }
+      }
       // If in naming mode, handle name input
-      if (this.isNamingMode) {
+      else if (this.isNamingMode) {
         const pane = findPaneById(this.paneRoot, this.focusedPaneId);
         if (keyName === 'escape') {
           this.isNamingMode = false;
@@ -549,12 +604,15 @@ class ProcessManager {
           this.selectedIndex = Math.min(this.scripts.length - 1, this.selectedIndex + 1);
           this.buildRunningUI(); // Rebuild to show selection change
         } else if (keyName === 'left' || keyName === 'h') {
-          // Navigate processes left
-          this.selectedIndex = Math.max(0, this.selectedIndex - 1);
+          // Navigate processes left with wrapping
+          this.selectedIndex = this.selectedIndex - 1;
+          if (this.selectedIndex < 0) {
+            this.selectedIndex = this.scripts.length - 1;
+          }
           this.buildRunningUI(); // Rebuild to show selection change
         } else if (keyName === 'right' || keyName === 'l') {
-          // Navigate processes right
-          this.selectedIndex = Math.min(this.scripts.length - 1, this.selectedIndex + 1);
+          // Navigate processes right with wrapping
+          this.selectedIndex = (this.selectedIndex + 1) % this.scripts.length;
           this.buildRunningUI(); // Rebuild to show selection change
         } else if (keyName === 'r') {
           const scriptName = this.scripts[this.selectedIndex]?.name;
@@ -568,13 +626,13 @@ class ProcessManager {
             this.toggleProcess(scriptName);
           }
         } else if (keyName === 'o') {
-          // Open settings (options)
-          this.previousPhase = 'running';
-          this.phase = 'settings';
-          this.settingsSection = 'ignore';
-          this.settingsIndex = 0;
-          this.buildSettingsUI();
-          return;
+      // Open settings (options)
+      this.previousPhase = 'running';
+      this.phase = 'settings';
+      this.settingsSection = 'display';
+      this.settingsIndex = 0;
+      this.buildSettingsUI();
+      return;
         } else if (keyName === 'c') {
           // Cycle color filter on focused pane
           const pane = findPaneById(this.paneRoot, this.focusedPaneId);
@@ -592,6 +650,35 @@ class ProcessManager {
           // Navigate to previous pane
           this.navigateToNextPane(-1);
           this.buildRunningUI();
+        } else if (keyName === 'home') {
+          // Scroll to top of focused pane
+          this.scrollFocusedPane('home');
+        } else if (keyName === 'end') {
+          // Scroll to bottom of focused pane
+          this.scrollFocusedPane('end');
+        } else if (keyName === 'pageup') {
+          // Scroll up one page in focused pane
+          this.scrollFocusedPane('pageup');
+        } else if (keyName === 'pagedown') {
+          // Scroll down one page in focused pane
+          this.scrollFocusedPane('pagedown');
+        } else if (keyName >= '1' && keyName <= '9') {
+          // Toggle process by number (1-9)
+          const index = parseInt(keyName) - 1;
+          if (index >= 0 && index < this.scripts.length) {
+            this.selectedIndex = index;
+            this.toggleProcessVisibility();
+            this.buildRunningUI();
+          }
+        } else if (keyName === 'i') {
+          // Enter input mode to send stdin to selected process
+          const scriptName = this.scripts[this.selectedIndex]?.name;
+          const proc = this.processes.get(scriptName);
+          if (scriptName && proc?.status === 'running') {
+            this.isInputMode = true;
+            this.inputModeText = '';
+            this.buildRunningUI();
+          }
         }
       }
     }
@@ -788,6 +875,19 @@ class ProcessManager {
       this.startProcess(scriptName);
     }
   }
+  
+  sendInputToProcess(scriptName, input) {
+    const proc = this.processRefs.get(scriptName);
+    if (proc && proc.stdin && proc.stdin.writable) {
+      try {
+        proc.stdin.write(input);
+        // Echo the input in the output for visibility
+        this.addOutputLine(scriptName, `> ${input.trim()}`);
+      } catch (err) {
+        this.addOutputLine(scriptName, `Error sending input: ${err.message}`);
+      }
+    }
+  }
 
   handleSettingsInput(keyName, keyEvent) {
     // Handle text input mode for adding patterns
@@ -824,6 +924,14 @@ class ProcessManager {
     
     // Normal settings navigation
     if (keyName === 'escape' || keyName === 'q') {
+      // Apply filters before returning (updates this.scripts)
+      this.applyFilters();
+      
+      // Ensure selectedIndex is within bounds after filter changes
+      if (this.selectedIndex >= this.scripts.length) {
+        this.selectedIndex = Math.max(0, this.scripts.length - 1);
+      }
+      
       // Return to previous phase
       if (this.previousPhase === 'running') {
         this.phase = 'running';
@@ -836,46 +944,76 @@ class ProcessManager {
       }
     } else if (keyName === 'tab' || keyName === 'right') {
       // Switch section
-      const sections = ['ignore', 'include', 'scripts'];
+      const sections = ['display', 'ignore', 'include', 'scripts'];
       const idx = sections.indexOf(this.settingsSection);
       this.settingsSection = sections[(idx + 1) % sections.length];
       this.settingsIndex = 0;
       this.buildSettingsUI();
     } else if (keyEvent.shift && keyName === 'tab') {
       // Switch section backwards
-      const sections = ['ignore', 'include', 'scripts'];
+      const sections = ['display', 'ignore', 'include', 'scripts'];
       const idx = sections.indexOf(this.settingsSection);
       this.settingsSection = sections[(idx - 1 + sections.length) % sections.length];
       this.settingsIndex = 0;
       this.buildSettingsUI();
     } else if (keyName === 'left') {
       // Switch section backwards
-      const sections = ['ignore', 'include', 'scripts'];
+      const sections = ['display', 'ignore', 'include', 'scripts'];
       const idx = sections.indexOf(this.settingsSection);
       this.settingsSection = sections[(idx - 1 + sections.length) % sections.length];
       this.settingsIndex = 0;
       this.buildSettingsUI();
     } else if (keyName === 'up') {
-      this.settingsIndex = Math.max(0, this.settingsIndex - 1);
-      this.buildSettingsUI();
+      if (this.settingsIndex > 0) {
+        this.settingsIndex--;
+        this.buildSettingsUI();
+      } else {
+        // Move to previous section
+        const sections = ['display', 'ignore', 'include', 'scripts'];
+        const idx = sections.indexOf(this.settingsSection);
+        if (idx > 0) {
+          this.settingsSection = sections[idx - 1];
+          this.settingsIndex = this.getSettingsMaxIndex();
+          this.buildSettingsUI();
+        }
+      }
     } else if (keyName === 'down') {
       const maxIndex = this.getSettingsMaxIndex();
-      this.settingsIndex = Math.min(maxIndex, this.settingsIndex + 1);
-      this.buildSettingsUI();
-    } else if (keyName === 'a') {
-      // Add new pattern (only for ignore/include sections)
-      if (this.settingsSection === 'ignore' || this.settingsSection === 'include') {
-        this.isAddingPattern = true;
-        this.newPatternText = '';
+      if (this.settingsIndex < maxIndex) {
+        this.settingsIndex++;
         this.buildSettingsUI();
+      } else {
+        // Move to next section
+        const sections = ['display', 'ignore', 'include', 'scripts'];
+        const idx = sections.indexOf(this.settingsSection);
+        if (idx < sections.length - 1) {
+          this.settingsSection = sections[idx + 1];
+          this.settingsIndex = 0;
+          this.buildSettingsUI();
+        }
       }
+    } else if (keyName === 'i') {
+      // Add new ignore pattern
+      this.settingsSection = 'ignore';
+      this.isAddingPattern = true;
+      this.newPatternText = '';
+      this.buildSettingsUI();
+    } else if (keyName === 'n') {
+      // Add new include pattern
+      this.settingsSection = 'include';
+      this.isAddingPattern = true;
+      this.newPatternText = '';
+      this.buildSettingsUI();
     } else if (keyName === 'd' || keyName === 'backspace') {
-      // Delete selected pattern or toggle script ignore
+      // Delete selected pattern
       this.deleteSelectedItem();
       this.buildSettingsUI();
     } else if (keyName === 'space' || keyName === 'enter' || keyName === 'return') {
-      // Toggle for scripts section
-      if (this.settingsSection === 'scripts') {
+      // Toggle display options, script visibility
+      if (this.settingsSection === 'display') {
+        this.toggleDisplayOption();
+        this.buildSettingsUI();
+      } else if (this.settingsSection === 'scripts') {
         this.toggleScriptIgnore();
         this.buildSettingsUI();
       }
@@ -883,14 +1021,29 @@ class ProcessManager {
   }
   
   getSettingsMaxIndex() {
-    if (this.settingsSection === 'ignore') {
-      return Math.max(0, (this.config.ignore?.length || 0) - 1);
+    if (this.settingsSection === 'display') {
+      return 1; // 2 display options (line numbers, timestamps)
+    } else if (this.settingsSection === 'ignore') {
+      const count = this.config.ignore?.length || 0;
+      return count > 0 ? count - 1 : 0;
     } else if (this.settingsSection === 'include') {
-      return Math.max(0, (this.config.include?.length || 0) - 1);
+      const count = this.config.include?.length || 0;
+      return count > 0 ? count - 1 : 0;
     } else if (this.settingsSection === 'scripts') {
       return Math.max(0, this.allScripts.length - 1);
     }
     return 0;
+  }
+  
+  toggleDisplayOption() {
+    if (this.settingsIndex === 0) {
+      this.showLineNumbers = !this.showLineNumbers;
+      this.config.showLineNumbers = this.showLineNumbers;
+    } else if (this.settingsIndex === 1) {
+      this.showTimestamps = !this.showTimestamps;
+      this.config.showTimestamps = this.showTimestamps;
+    }
+    saveConfig(this.config);
   }
   
   deleteSelectedItem() {
@@ -1026,6 +1179,9 @@ class ProcessManager {
       items.push({ label: 'Next Pane', shortcut: 'Tab', action: () => this.navigateToNextPane(1) });
       items.push({ label: 'Previous Pane', shortcut: 'Shift+Tab', action: () => this.navigateToNextPane(-1) });
     }
+    
+    items.push({ label: 'Toggle Line Numbers', shortcut: '#', action: () => { this.showLineNumbers = !this.showLineNumbers; } });
+    items.push({ label: 'Toggle Timestamps', shortcut: 't', action: () => { this.showTimestamps = !this.showTimestamps; } });
     
     return items;
   }
@@ -1178,6 +1334,42 @@ class ProcessManager {
     saveConfig(this.config);
   }
   
+  // Scroll the focused pane
+  scrollFocusedPane(direction) {
+    if (!this.focusedPaneId) return;
+    
+    const scrollBox = this.paneScrollBoxes.get(this.focusedPaneId);
+    if (!scrollBox || !scrollBox.scrollTo) return;
+    
+    const currentY = scrollBox.scrollTop || 0;
+    const viewportHeight = scrollBox.height || 20;
+    const contentHeight = scrollBox.contentHeight || 0;
+    
+    let newY = currentY;
+    
+    if (direction === 'home') {
+      newY = 0;
+    } else if (direction === 'end') {
+      newY = Number.MAX_SAFE_INTEGER;
+    } else if (direction === 'pageup') {
+      newY = Math.max(0, currentY - viewportHeight);
+    } else if (direction === 'pagedown') {
+      newY = Math.min(contentHeight - viewportHeight, currentY + viewportHeight);
+    }
+    
+    scrollBox.scrollTo({ x: 0, y: newY });
+    
+    // Save the new scroll position
+    this.paneScrollPositions.set(this.focusedPaneId, { x: 0, y: newY });
+    
+    // Auto-pause when manually scrolling (unless going to end)
+    if (direction !== 'end' && !this.isPaused) {
+      this.isPaused = true;
+      this.updateStreamPauseState();
+      this.buildRunningUI();
+    }
+  }
+  
   // Check if a process is visible in the focused pane
   isProcessVisibleInPane(scriptName, pane) {
     if (!pane) return true;
@@ -1302,54 +1494,82 @@ class ProcessManager {
       this.settingsContainer.add(inputBar);
     }
     
-    // Section tabs
-    const tabsContainer = new BoxRenderable(this.renderer, {
-      id: 'tabs-container',
-      flexDirection: 'row',
-      gap: 2,
-      marginBottom: 1,
-    });
-    
-    const sections = [
-      { id: 'ignore', label: 'IGNORE' },
-      { id: 'include', label: 'INCLUDE' },
-      { id: 'scripts', label: 'SCRIPTS' },
-    ];
-    
-    sections.forEach(({ id, label }) => {
-      const isActive = this.settingsSection === id;
-      const tab = new TextRenderable(this.renderer, {
-        id: `tab-${id}`,
-        content: isActive 
-          ? t`${fg(COLORS.accent)('[' + label + ']')}`
-          : t`${fg(COLORS.textDim)(' ' + label + ' ')}`,
-      });
-      tabsContainer.add(tab);
-    });
-    
-    this.settingsContainer.add(tabsContainer);
-    
-    // Content panel with border
+    // Combined content panel with all sections
     const contentPanel = new BoxRenderable(this.renderer, {
       id: 'content-panel',
+      flexDirection: 'row',
+      flexGrow: 1,
+      gap: 1,
+    });
+    
+    // Left column - Display options, Ignore, Include
+    const leftColumn = new BoxRenderable(this.renderer, {
+      id: 'left-column',
+      flexDirection: 'column',
+      flexGrow: 1,
+      gap: 1,
+    });
+    
+    // Display options section
+    const displayBox = new BoxRenderable(this.renderer, {
+      id: 'display-box',
       flexDirection: 'column',
       border: true,
       borderStyle: 'rounded',
-      borderColor: COLORS.border,
-      title: ` ${this.settingsSection.charAt(0).toUpperCase() + this.settingsSection.slice(1)} `,
+      borderColor: this.settingsSection === 'display' ? COLORS.borderFocused : COLORS.border,
+      title: ' Display Options ',
       titleAlignment: 'left',
-      flexGrow: 1,
       padding: 1,
     });
+    this.buildDisplaySectionContent(displayBox);
+    leftColumn.add(displayBox);
     
-    // Section content
-    if (this.settingsSection === 'ignore') {
-      this.buildIgnoreSectionContent(contentPanel);
-    } else if (this.settingsSection === 'include') {
-      this.buildIncludeSectionContent(contentPanel);
-    } else if (this.settingsSection === 'scripts') {
-      this.buildScriptsSectionContent(contentPanel);
-    }
+    // Ignore patterns section
+    const ignoreBox = new BoxRenderable(this.renderer, {
+      id: 'ignore-box',
+      flexDirection: 'column',
+      border: true,
+      borderStyle: 'rounded',
+      borderColor: this.settingsSection === 'ignore' ? COLORS.borderFocused : COLORS.border,
+      title: ' Ignore Patterns (i) ',
+      titleAlignment: 'left',
+      padding: 1,
+      flexGrow: 1,
+    });
+    this.buildIgnoreSectionContent(ignoreBox);
+    leftColumn.add(ignoreBox);
+    
+    // Include patterns section
+    const includeBox = new BoxRenderable(this.renderer, {
+      id: 'include-box',
+      flexDirection: 'column',
+      border: true,
+      borderStyle: 'rounded',
+      borderColor: this.settingsSection === 'include' ? COLORS.borderFocused : COLORS.border,
+      title: ' Include Patterns (n) ',
+      titleAlignment: 'left',
+      padding: 1,
+      flexGrow: 1,
+    });
+    this.buildIncludeSectionContent(includeBox);
+    leftColumn.add(includeBox);
+    
+    contentPanel.add(leftColumn);
+    
+    // Right column - Scripts list
+    const scriptsBox = new BoxRenderable(this.renderer, {
+      id: 'scripts-box',
+      flexDirection: 'column',
+      border: true,
+      borderStyle: 'rounded',
+      borderColor: this.settingsSection === 'scripts' ? COLORS.borderFocused : COLORS.border,
+      title: ' Scripts ',
+      titleAlignment: 'left',
+      flexGrow: 2,
+      padding: 1,
+    });
+    this.buildScriptsSectionContent(scriptsBox);
+    contentPanel.add(scriptsBox);
     
     this.settingsContainer.add(contentPanel);
     
@@ -1373,9 +1593,10 @@ class ProcessManager {
         ]
       : [
           { key: 'tab', desc: 'section' },
-          { key: 'a', desc: 'add' },
-          { key: 'd', desc: 'delete' },
           { key: 'space', desc: 'toggle' },
+          { key: 'i', desc: 'add ignore' },
+          { key: 'n', desc: 'add include' },
+          { key: 'd', desc: 'delete' },
           { key: 'esc', desc: 'back' },
         ];
     
@@ -1392,26 +1613,38 @@ class ProcessManager {
     this.renderer.root.add(this.settingsContainer);
   }
   
-  buildIgnoreSectionContent(container) {
-    const desc = new TextRenderable(this.renderer, {
-      id: 'ignore-desc',
-      content: t`${fg(COLORS.textDim)('Patterns to exclude from script list. Use * as wildcard.')}`,
+  buildDisplaySectionContent(container) {
+    const options = [
+      { id: 'lineNumbers', label: 'Show Line Numbers', value: this.showLineNumbers },
+      { id: 'timestamps', label: 'Show Timestamps', value: this.showTimestamps },
+    ];
+    
+    options.forEach((option, idx) => {
+      const isFocused = this.settingsSection === 'display' && idx === this.settingsIndex;
+      const indicator = isFocused ? '>' : ' ';
+      const checkbox = option.value ? '[x]' : '[ ]';
+      const checkColor = option.value ? COLORS.success : COLORS.textDim;
+      
+      const line = new TextRenderable(this.renderer, {
+        id: `display-option-${idx}`,
+        content: t`${fg(isFocused ? COLORS.accent : COLORS.textDim)(indicator)} ${fg(checkColor)(checkbox)} ${fg(COLORS.text)(option.label)}`,
+      });
+      container.add(line);
     });
-    container.add(desc);
-    
-    container.add(new TextRenderable(this.renderer, { id: 'spacer', content: '' }));
-    
+  }
+  
+  buildIgnoreSectionContent(container) {
     const patterns = this.config.ignore || [];
     
     if (patterns.length === 0) {
       const empty = new TextRenderable(this.renderer, {
         id: 'ignore-empty',
-        content: t`${fg(COLORS.textDim)('No ignore patterns defined. Press A to add.')}`,
+        content: t`${fg(COLORS.textDim)('Press i to add')}`,
       });
       container.add(empty);
     } else {
       patterns.forEach((pattern, idx) => {
-        const isFocused = idx === this.settingsIndex;
+        const isFocused = this.settingsSection === 'ignore' && idx === this.settingsIndex;
         const indicator = isFocused ? '>' : ' ';
         
         const line = new TextRenderable(this.renderer, {
@@ -1424,25 +1657,17 @@ class ProcessManager {
   }
   
   buildIncludeSectionContent(container) {
-    const desc = new TextRenderable(this.renderer, {
-      id: 'include-desc',
-      content: t`${fg(COLORS.textDim)('Only show scripts matching these patterns. Use * as wildcard.')}`,
-    });
-    container.add(desc);
-    
-    container.add(new TextRenderable(this.renderer, { id: 'spacer', content: '' }));
-    
     const patterns = this.config.include || [];
     
     if (patterns.length === 0) {
       const empty = new TextRenderable(this.renderer, {
         id: 'include-empty',
-        content: t`${fg(COLORS.textDim)('No include patterns (all scripts shown). Press A to add.')}`,
+        content: t`${fg(COLORS.textDim)('Press n to add')}`,
       });
       container.add(empty);
     } else {
       patterns.forEach((pattern, idx) => {
-        const isFocused = idx === this.settingsIndex;
+        const isFocused = this.settingsSection === 'include' && idx === this.settingsIndex;
         const indicator = isFocused ? '>' : ' ';
         
         const line = new TextRenderable(this.renderer, {
@@ -1455,19 +1680,11 @@ class ProcessManager {
   }
   
   buildScriptsSectionContent(container) {
-    const desc = new TextRenderable(this.renderer, {
-      id: 'scripts-desc',
-      content: t`${fg(COLORS.textDim)('Toggle individual scripts. Ignored scripts are hidden from selection.')}`,
-    });
-    container.add(desc);
-    
-    container.add(new TextRenderable(this.renderer, { id: 'spacer', content: '' }));
-    
     const ignorePatterns = this.config.ignore || [];
     
     this.allScripts.forEach((script, idx) => {
       const isIgnored = ignorePatterns.includes(script.name);
-      const isFocused = idx === this.settingsIndex;
+      const isFocused = this.settingsSection === 'scripts' && idx === this.settingsIndex;
       const indicator = isFocused ? '>' : ' ';
       const checkbox = isIgnored ? '[x]' : '[ ]';
       const checkColor = isIgnored ? COLORS.error : COLORS.success;
@@ -1563,14 +1780,22 @@ class ProcessManager {
     this.scriptLines = this.scripts.map((script, index) => {
       const isSelected = this.selectedScripts.has(script.name);
       const isFocused = index === this.selectedIndex;
-      const checkIcon = isSelected ? '●' : '○';
-      const checkColor = isSelected ? COLORS.success : COLORS.textDim;
       const processColor = this.processColors.get(script.name) || COLORS.text;
       const nameColor = isFocused ? COLORS.text : processColor;
+      const numberColor = processColor;
+      const bracketColor = processColor;
       const bgColor = isFocused ? COLORS.bgHighlight : null;
       
-      // Build styled content - all in one template, no nesting
-      const content = t`${fg(checkColor)(checkIcon)} ${fg(nameColor)(script.displayName)}`;
+      // Show number for first 9 scripts
+      const numberLabel = index < 9 ? ` ${index + 1}` : '  ';
+      
+      // Build checkbox with colored brackets and white x (like running screen)
+      let content;
+      if (isSelected) {
+        content = t`${fg(numberColor)(numberLabel)} ${fg(bracketColor)('[')}${fg(COLORS.text)('x')}${fg(bracketColor)(']')} ${fg(nameColor)(script.displayName)}`;
+      } else {
+        content = t`${fg(numberColor)(numberLabel)} ${fg(bracketColor)('[ ]')} ${fg(nameColor)(script.displayName)}`;
+      }
       
       const lineContainer = new BoxRenderable(this.renderer, {
         id: `script-box-${index}`,
@@ -1835,11 +2060,25 @@ class ProcessManager {
               const line = newLines[i];
               const processColor = this.processColors.get(line.process) || COLORS.text;
               const trimmedText = line.text.trim();
-              const lineNumber = String(line.lineNumber).padStart(4, ' ');
+              
+              // Build content with proper template literal
+              const lineNumber = this.showLineNumbers ? String(line.lineNumber).padStart(4, ' ') : '';
+              const timestamp = this.showTimestamps ? new Date(line.timestamp).toLocaleTimeString('en-US', { hour12: false }) : '';
+              
+              let content;
+              if (this.showLineNumbers && this.showTimestamps) {
+                content = t`${fg(COLORS.textDim)(lineNumber)} ${fg(COLORS.textDim)(`[${timestamp}]`)} ${fg(processColor)(`[${line.process}]`)} ${trimmedText}`;
+              } else if (this.showLineNumbers) {
+                content = t`${fg(COLORS.textDim)(lineNumber)} ${fg(processColor)(`[${line.process}]`)} ${trimmedText}`;
+              } else if (this.showTimestamps) {
+                content = t`${fg(COLORS.textDim)(`[${timestamp}]`)} ${fg(processColor)(`[${line.process}]`)} ${trimmedText}`;
+              } else {
+                content = t`${fg(processColor)(`[${line.process}]`)} ${trimmedText}`;
+              }
               
               const outputLine = new TextRenderable(this.renderer, {
                 id: `output-${pane.id}-${line.lineNumber}`,
-                content: t`${fg(COLORS.textDim)(lineNumber)} ${fg(processColor)(`[${line.process}]`)} ${trimmedText}`,
+                content: content,
                 bg: '#000000',
               });
               
@@ -1883,10 +2122,25 @@ class ProcessManager {
       
       // Trim whitespace and let text wrap naturally - ScrollBox will handle overflow
       const trimmedText = line.text.trim();
-      const lineNumber = String(i + 1).padStart(4, ' ');
+      
+      // Build content with proper template literal
+      const lineNumber = this.showLineNumbers ? String(line.lineNumber).padStart(4, ' ') : '';
+      const timestamp = this.showTimestamps ? new Date(line.timestamp).toLocaleTimeString('en-US', { hour12: false }) : '';
+      
+      let content;
+      if (this.showLineNumbers && this.showTimestamps) {
+        content = t`${fg(COLORS.textDim)(lineNumber)} ${fg(COLORS.textDim)(`[${timestamp}]`)} ${fg(processColor)(`[${line.process}]`)} ${trimmedText}`;
+      } else if (this.showLineNumbers) {
+        content = t`${fg(COLORS.textDim)(lineNumber)} ${fg(processColor)(`[${line.process}]`)} ${trimmedText}`;
+      } else if (this.showTimestamps) {
+        content = t`${fg(COLORS.textDim)(`[${timestamp}]`)} ${fg(processColor)(`[${line.process}]`)} ${trimmedText}`;
+      } else {
+        content = t`${fg(processColor)(`[${line.process}]`)} ${trimmedText}`;
+      }
+      
       const outputLine = new TextRenderable(this.renderer, {
         id: `output-${pane.id}-${i}`,
-        content: t`${fg(COLORS.textDim)(lineNumber)} ${fg(processColor)(`[${line.process}]`)} ${trimmedText}`,
+        content: content,
         bg: '#000000', // Black background for pane content
       });
       
@@ -2132,15 +2386,7 @@ class ProcessManager {
       paddingLeft: 1,
     });
     
-    // Pane count indicator
-    const allPanes = getAllPaneIds(this.paneRoot);
-    if (allPanes.length > 1) {
-      const paneIndicator = new TextRenderable(this.renderer, {
-        id: 'pane-indicator',
-        content: t`${fg(COLORS.cyan)(`[${allPanes.length} panes]`)} `,
-      });
-      processBar.add(paneIndicator);
-    }
+
     
     // Add each process with checkbox showing visibility in focused pane
     const focusedPane = findPaneById(this.paneRoot, this.focusedPaneId);
@@ -2153,13 +2399,25 @@ class ProcessManager {
       const processColor = this.processColors.get(script.name) || COLORS.text;
       const isSelected = this.selectedIndex === index;
       const isVisible = this.isProcessVisibleInPane(script.name, focusedPane);
-      const checkbox = isVisible ? '[x]' : '[ ]';
       const nameColor = isSelected ? COLORS.accent : (isVisible ? processColor : COLORS.textDim);
+      const numberColor = isVisible ? processColor : COLORS.textDim;
       const indicator = isSelected ? '>' : ' ';
+      const bracketColor = isVisible ? processColor : COLORS.textDim;
+      
+      // Show number for first 9 processes
+      const numberLabel = index < 9 ? `${index + 1}` : ' ';
+      
+      // Build content - can't nest template literals, so build entire thing at once
+      let content;
+      if (isVisible) {
+        content = t`${fg(numberColor)(numberLabel)} ${fg(isSelected ? COLORS.accent : COLORS.textDim)(indicator)}${fg(bracketColor)('[')}${fg(COLORS.text)('x')}${fg(bracketColor)(']')} ${fg(statusColor)(statusIcon)} ${fg(nameColor)(script.displayName)}`;
+      } else {
+        content = t`${fg(numberColor)(numberLabel)} ${fg(isSelected ? COLORS.accent : COLORS.textDim)(indicator)}${fg(bracketColor)('[ ]')} ${fg(statusColor)(statusIcon)} ${fg(nameColor)(script.displayName)}`;
+      }
       
       const processItem = new TextRenderable(this.renderer, {
         id: `process-item-${index}`,
-        content: t`${fg(isSelected ? COLORS.accent : COLORS.textDim)(indicator)}${fg(isVisible ? COLORS.text : COLORS.textDim)(checkbox)} ${fg(nameColor)(script.displayName)} ${fg(statusColor)(statusIcon)}`,
+        content: content,
       });
       processBar.add(processItem);
     });
@@ -2230,6 +2488,17 @@ class ProcessManager {
       leftSide.add(filterIndicator);
     }
     
+    // Input mode indicator if active
+    if (this.isInputMode) {
+      const scriptName = this.scripts[this.selectedIndex]?.displayName || '';
+      const inputText = `[${scriptName}]> ${this.inputModeText}_`;
+      const inputIndicator = new TextRenderable(this.renderer, {
+        id: 'input-indicator',
+        content: t`${fg(COLORS.success)(inputText)}`,
+      });
+      leftSide.add(inputIndicator);
+    }
+    
     // Color filter indicator if active on focused pane
     if (focusedPane?.colorFilter) {
       const colorMap = {
@@ -2258,11 +2527,14 @@ class ProcessManager {
     
     const shortcuts = [
       { key: '\\', desc: 'panes', color: COLORS.cyan },
-      { key: 'spc', desc: 'toggle', color: COLORS.success },
+      { key: '1-9', desc: 'toggle', color: COLORS.success },
+      { key: 'i', desc: 'input', color: COLORS.success },
       { key: 'n', desc: 'name', color: COLORS.accent },
       { key: 'p', desc: 'pause', color: COLORS.warning },
       { key: '/', desc: 'filter', color: COLORS.cyan },
       { key: 'c', desc: 'color', color: COLORS.magenta },
+      { key: '#', desc: 'lines', color: COLORS.textDim },
+      { key: 't', desc: 'time', color: COLORS.textDim },
       { key: 's', desc: 'stop', color: COLORS.error },
       { key: 'r', desc: 'restart', color: COLORS.success },
       { key: 'q', desc: 'quit', color: COLORS.error },
