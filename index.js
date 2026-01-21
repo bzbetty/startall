@@ -328,6 +328,7 @@ class ProcessManager {
     this.processes = new Map();
     this.processRefs = new Map();
     this.outputLines = [];
+    this.totalLinesReceived = 0;  // Track total lines ever received (never resets)
     this.filter = '';
     this.maxOutputLines = 1000;
     this.maxVisibleLines = null;  // Calculated dynamically based on screen height
@@ -734,6 +735,7 @@ class ProcessManager {
       process: processName,
       text,
       timestamp: Date.now(),
+      lineNumber: ++this.totalLinesReceived,  // Track absolute line number
     });
     
     if (this.outputLines.length > this.maxOutputLines) {
@@ -748,13 +750,10 @@ class ProcessManager {
   }
   
   scheduleRender() {
-    // Throttle renders to ~60fps to reduce CPU usage
-    if (this.renderScheduled) return;
-    this.renderScheduled = true;
-    setTimeout(() => {
-      this.renderScheduled = false;
+    // Update the DOM - OpenTUI's render loop will pick up changes automatically
+    if (!this.destroyed) {
       this.render();
-    }, 16);
+    }
   }
 
   stopProcess(scriptName) {
@@ -1815,87 +1814,51 @@ class ProcessManager {
   }
   
   updateRunningUI() {
-    // Update existing panes instead of rebuilding everything
+    // Update existing panes incrementally, or rebuild if needed
     if (this.paneScrollBoxes.size > 0) {
-      // Update each pane's content
+      // Incremental update - just append new lines to existing panes
+      let hasNewContent = false;
+      
       for (const [paneId, scrollBox] of this.paneScrollBoxes.entries()) {
         const pane = findPaneById(this.paneRoot, paneId);
         if (pane && scrollBox && scrollBox.content) {
-          // Check if filter state changed or if paused (requires rebuild)
-          const currentFilterState = JSON.stringify({
-            filter: pane.filter || '',
-            hidden: pane.hidden || [],
-            processes: pane.processes || [],
-            colorFilter: pane.colorFilter || null,
-          });
-          const previousFilterState = this.paneFilterState.get(paneId);
-          const filterChanged = currentFilterState !== previousFilterState;
-          const needsRebuild = filterChanged || this.isPaused;
+          const lines = this.getOutputLinesForPane(pane);
+          const lastRenderedLineNumber = this.paneLineCount.get(paneId) || 0;
           
-          if (needsRebuild) {
-            // Filter changed - need to rebuild all content
-            this.paneFilterState.set(paneId, currentFilterState);
+          // Find lines that haven't been rendered yet (based on absolute line number)
+          const newLines = lines.filter(line => line.lineNumber > lastRenderedLineNumber);
+          
+          if (newLines.length > 0) {
+            hasNewContent = true;
             
-            // Remove all children
-            if (scrollBox.content.children) {
-              while (scrollBox.content.children.length > 0) {
-                const child = scrollBox.content.children[0];
-                if (child && child.id) {
-                  scrollBox.content.remove(child.id);
-                } else {
-                  break;
-                }
+            for (let i = 0; i < newLines.length; i++) {
+              const line = newLines[i];
+              const processColor = this.processColors.get(line.process) || COLORS.text;
+              const trimmedText = line.text.trim();
+              const lineNumber = String(line.lineNumber).padStart(4, ' ');
+              
+              const outputLine = new TextRenderable(this.renderer, {
+                id: `output-${pane.id}-${line.lineNumber}`,
+                content: t`${fg(COLORS.textDim)(lineNumber)} ${fg(processColor)(`[${line.process}]`)} ${trimmedText}`,
+                bg: '#000000',
+              });
+              
+              scrollBox.content.add(outputLine);
+              
+              // Remove oldest line if we exceed maxOutputLines to maintain rolling window
+              if (scrollBox.content.children && scrollBox.content.children.length > this.maxOutputLines) {
+                const oldestChild = scrollBox.content.children[0];
+                scrollBox.content.remove(oldestChild);
               }
             }
             
-            // Rebuild all content
-            const height = scrollBox.height || this.renderer.height - 6;
-            this.buildPaneOutput(pane, scrollBox.content, height);
+            // Update to track the last absolute line number we rendered
+            this.paneLineCount.set(paneId, newLines[newLines.length - 1].lineNumber);
             
-            // Update line count after rebuild
-            const lines = this.getOutputLinesForPane(pane);
-            this.paneLineCount.set(paneId, lines.length);
-            
-            // Auto-scroll to bottom after filter change
-            if (!this.isPaused) {
+            // Auto-scroll to bottom if not paused
+            if (!this.isPaused && scrollBox.scrollTo) {
               scrollBox.scrollTo({ x: 0, y: Number.MAX_SAFE_INTEGER });
             }
-          } else {
-            // No filter change - just append new lines
-            const lines = this.getOutputLinesForPane(pane);
-            const lastRenderedCount = this.paneLineCount.get(paneId) || 0;
-            
-            if (lines.length > lastRenderedCount) {
-              const newLines = lines.slice(lastRenderedCount);
-              
-              for (let i = 0; i < newLines.length; i++) {
-                const line = newLines[i];
-                const lineIndex = lastRenderedCount + i;
-                const processColor = this.processColors.get(line.process) || COLORS.text;
-                const trimmedText = line.text.trim();
-                
-                const outputLine = new TextRenderable(this.renderer, {
-                  id: `output-${pane.id}-${lineIndex}`,
-                  content: t`${fg(processColor)(`[${line.process}]`)} ${trimmedText}`,
-                  bg: '#000000',
-                });
-                
-                scrollBox.content.add(outputLine);
-              }
-              
-              // Update line count
-              this.paneLineCount.set(paneId, lines.length);
-              
-              // Auto-scroll to bottom if not paused
-              if (!this.isPaused) {
-                scrollBox.scrollTo({ x: 0, y: Number.MAX_SAFE_INTEGER });
-              }
-            }
-          }
-          
-          // Update scrollbar visibility based on pause state
-          if (scrollBox.verticalScrollBar) {
-            scrollBox.verticalScrollBar.width = this.isPaused ? 1 : 0;
           }
         }
       }
@@ -1920,9 +1883,10 @@ class ProcessManager {
       
       // Trim whitespace and let text wrap naturally - ScrollBox will handle overflow
       const trimmedText = line.text.trim();
+      const lineNumber = String(i + 1).padStart(4, ' ');
       const outputLine = new TextRenderable(this.renderer, {
         id: `output-${pane.id}-${i}`,
-        content: t`${fg(processColor)(`[${line.process}]`)} ${trimmedText}`,
+        content: t`${fg(COLORS.textDim)(lineNumber)} ${fg(processColor)(`[${line.process}]`)} ${trimmedText}`,
         bg: '#000000', // Black background for pane content
       });
       
@@ -2012,10 +1976,8 @@ class ProcessManager {
     
     this.buildPaneOutput(pane, outputBox.content, height);
     
-    // Restore or set scroll position
-    setTimeout(() => {
-      if (!outputBox || !outputBox.scrollTo) return;
-      
+    // Restore or set scroll position immediately
+    if (outputBox && outputBox.scrollTo) {
       if (this.isPaused && this.paneScrollPositions.has(pane.id)) {
         // Restore saved scroll position when paused
         const savedPos = this.paneScrollPositions.get(pane.id);
@@ -2024,7 +1986,7 @@ class ProcessManager {
         // Auto-scroll to bottom when not paused
         outputBox.scrollTo({ x: 0, y: Number.MAX_SAFE_INTEGER });
       }
-    }, 0);
+    }
     
     paneContainer.add(outputBox);
     return paneContainer;
@@ -2352,6 +2314,7 @@ async function main() {
   }
 
   const renderer = await createCliRenderer();
+  renderer.start(); // Start the automatic render loop
   const manager = new ProcessManager(renderer, scripts);
   
   // Handle cleanup on exit
