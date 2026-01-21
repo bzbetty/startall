@@ -10,7 +10,18 @@ import stripAnsi from 'strip-ansi';
 // Configuration
 const CONFIG_FILE = process.argv[2] || 'startall.json';
 const COUNTDOWN_SECONDS = 10;
-const APP_VERSION = 'v0.0.4';
+
+// Read version from package.json
+function getAppVersion() {
+  try {
+    const packagePath = new URL('./package.json', import.meta.url);
+    const pkg = JSON.parse(readFileSync(packagePath, 'utf8'));
+    return `v${pkg.version}`;
+  } catch (error) {
+    return 'v0.0.0'; // Fallback if package.json can't be read
+  }
+}
+const APP_VERSION = getAppVersion();
 
 // Detect if running inside VS Code's integrated terminal
 const IS_VSCODE = process.env.TERM_PROGRAM === 'vscode';
@@ -307,10 +318,10 @@ function loadConfig() {
     try {
       return JSON.parse(readFileSync(CONFIG_FILE, 'utf8'));
     } catch {
-      return { defaultSelection: [], ignore: [] };
+      return { defaultSelection: [], ignore: [], shortcuts: {} };
     }
   }
-  return { defaultSelection: [], ignore: [] };
+  return { defaultSelection: [], ignore: [], shortcuts: {} };
 }
 
 // Save config
@@ -353,12 +364,21 @@ class ProcessManager {
     this.inputModeText = '';  // Text being typed for stdin
     
     // Settings menu state
-    this.settingsSection = 'display';  // 'display' | 'ignore' | 'include' | 'scripts'
+    this.settingsSection = 'display';  // 'display' | 'ignore' | 'include' | 'scripts' | 'shortcuts'
     this.settingsIndex = 0;  // Current selection index within section
     this.isAddingPattern = false;  // Whether typing a new pattern
     this.newPatternText = '';  // Text being typed for new pattern
+    this.isAssigningShortcut = false;  // Whether waiting for a key to assign as shortcut
+    this.shortcutScriptName = '';  // Script name being assigned a shortcut
     this.settingsContainer = null;  // UI reference
     this.previousPhase = 'selection';  // Track where we came from
+    
+    // Command execution overlay state
+    this.showCommandOverlay = false;  // Whether command output overlay is visible
+    this.commandOverlayOutput = [];  // Output lines from command
+    this.commandOverlayScript = '';  // Script name being executed
+    this.commandOverlayStatus = 'running';  // 'running' | 'exited' | 'crashed'
+    this.commandOverlayProcess = null;  // Process reference
     this.outputBox = null;  // Reference to the output container
     this.destroyed = false;  // Flag to prevent operations after cleanup
     this.lastRenderedLineCount = 0;  // Track how many lines we've rendered
@@ -465,6 +485,15 @@ class ProcessManager {
       this.handleSettingsInput(keyName, keyEvent);
       return;
     } else if (this.phase === 'running') {
+      // Handle command overlay
+      if (this.showCommandOverlay) {
+        if (keyName === 'escape') {
+          this.closeCommandOverlay();
+          this.buildRunningUI();
+        }
+        return;
+      }
+      
       // Handle split menu
       if (this.showSplitMenu) {
         this.handleSplitMenuInput(keyName, keyEvent);
@@ -679,6 +708,17 @@ class ProcessManager {
             this.inputModeText = '';
             this.buildRunningUI();
           }
+        } else if (keyName && keyName.length === 1 && !keyEvent.ctrl && !keyEvent.meta && !keyEvent.shift) {
+          // Check if this key is a custom shortcut
+          const shortcuts = this.config.shortcuts || {};
+          const scriptName = shortcuts[keyName];
+          if (scriptName) {
+            // Find the script in allScripts (since it might be ignored/filtered out)
+            const script = this.allScripts.find(s => s.name === scriptName);
+            if (script) {
+              this.executeCommand(scriptName);
+            }
+          }
         }
       }
     }
@@ -890,6 +930,40 @@ class ProcessManager {
   }
 
   handleSettingsInput(keyName, keyEvent) {
+    // Handle shortcut assignment mode
+    if (this.isAssigningShortcut) {
+      if (keyName === 'escape') {
+        this.isAssigningShortcut = false;
+        this.shortcutScriptName = '';
+        this.buildSettingsUI();
+        return;
+      } else if (keyName && keyName.length === 1 && !keyEvent.ctrl && !keyEvent.meta && !keyEvent.shift) {
+        // Assign this key to the script
+        if (!this.config.shortcuts) this.config.shortcuts = {};
+        
+        // Remove any existing shortcut for this script (one key per script)
+        for (const [key, scriptName] of Object.entries(this.config.shortcuts)) {
+          if (scriptName === this.shortcutScriptName) {
+            delete this.config.shortcuts[key];
+          }
+        }
+        
+        // Also remove this key if it's assigned to another script (one script per key)
+        if (this.config.shortcuts[keyName]) {
+          delete this.config.shortcuts[keyName];
+        }
+        
+        // Assign the new shortcut
+        this.config.shortcuts[keyName] = this.shortcutScriptName;
+        saveConfig(this.config);
+        this.isAssigningShortcut = false;
+        this.shortcutScriptName = '';
+        this.buildSettingsUI();
+        return;
+      }
+      return;
+    }
+    
     // Handle text input mode for adding patterns
     if (this.isAddingPattern) {
       if (keyName === 'escape') {
@@ -944,21 +1018,21 @@ class ProcessManager {
       }
     } else if (keyName === 'tab' || keyName === 'right') {
       // Switch section
-      const sections = ['display', 'ignore', 'include', 'scripts'];
+      const sections = ['display', 'ignore', 'include', 'shortcuts', 'scripts'];
       const idx = sections.indexOf(this.settingsSection);
       this.settingsSection = sections[(idx + 1) % sections.length];
       this.settingsIndex = 0;
       this.buildSettingsUI();
     } else if (keyEvent.shift && keyName === 'tab') {
       // Switch section backwards
-      const sections = ['display', 'ignore', 'include', 'scripts'];
+      const sections = ['display', 'ignore', 'include', 'shortcuts', 'scripts'];
       const idx = sections.indexOf(this.settingsSection);
       this.settingsSection = sections[(idx - 1 + sections.length) % sections.length];
       this.settingsIndex = 0;
       this.buildSettingsUI();
     } else if (keyName === 'left') {
       // Switch section backwards
-      const sections = ['display', 'ignore', 'include', 'scripts'];
+      const sections = ['display', 'ignore', 'include', 'shortcuts', 'scripts'];
       const idx = sections.indexOf(this.settingsSection);
       this.settingsSection = sections[(idx - 1 + sections.length) % sections.length];
       this.settingsIndex = 0;
@@ -969,7 +1043,7 @@ class ProcessManager {
         this.buildSettingsUI();
       } else {
         // Move to previous section
-        const sections = ['display', 'ignore', 'include', 'scripts'];
+        const sections = ['display', 'ignore', 'include', 'shortcuts', 'scripts'];
         const idx = sections.indexOf(this.settingsSection);
         if (idx > 0) {
           this.settingsSection = sections[idx - 1];
@@ -984,7 +1058,7 @@ class ProcessManager {
         this.buildSettingsUI();
       } else {
         // Move to next section
-        const sections = ['display', 'ignore', 'include', 'scripts'];
+        const sections = ['display', 'ignore', 'include', 'shortcuts', 'scripts'];
         const idx = sections.indexOf(this.settingsSection);
         if (idx < sections.length - 1) {
           this.settingsSection = sections[idx + 1];
@@ -1005,14 +1079,16 @@ class ProcessManager {
       this.newPatternText = '';
       this.buildSettingsUI();
     } else if (keyName === 'd' || keyName === 'backspace') {
-      // Delete selected pattern
+      // Delete selected pattern or shortcut
       this.deleteSelectedItem();
       this.buildSettingsUI();
     } else if (keyName === 'space' || keyName === 'enter' || keyName === 'return') {
-      // Toggle display options, script visibility
+      // Toggle display options, script visibility, or assign shortcut
       if (this.settingsSection === 'display') {
         this.toggleDisplayOption();
         this.buildSettingsUI();
+      } else if (this.settingsSection === 'shortcuts') {
+        this.assignShortcut();
       } else if (this.settingsSection === 'scripts') {
         this.toggleScriptIgnore();
         this.buildSettingsUI();
@@ -1029,6 +1105,8 @@ class ProcessManager {
     } else if (this.settingsSection === 'include') {
       const count = this.config.include?.length || 0;
       return count > 0 ? count - 1 : 0;
+    } else if (this.settingsSection === 'shortcuts') {
+      return Math.max(0, this.allScripts.length - 1);
     } else if (this.settingsSection === 'scripts') {
       return Math.max(0, this.allScripts.length - 1);
     }
@@ -1059,6 +1137,27 @@ class ProcessManager {
       saveConfig(this.config);
       this.applyFilters();
       this.settingsIndex = Math.max(0, Math.min(this.settingsIndex, (this.config.include?.length || 1) - 1));
+    } else if (this.settingsSection === 'shortcuts') {
+      const script = this.allScripts[this.settingsIndex];
+      if (script && this.config.shortcuts) {
+        // Find and delete any shortcut assigned to this script
+        for (const [key, scriptName] of Object.entries(this.config.shortcuts)) {
+          if (scriptName === script.name) {
+            delete this.config.shortcuts[key];
+            saveConfig(this.config);
+            break;
+          }
+        }
+      }
+    }
+  }
+  
+  assignShortcut() {
+    const script = this.allScripts[this.settingsIndex];
+    if (script) {
+      this.isAssigningShortcut = true;
+      this.shortcutScriptName = script.name;
+      this.buildSettingsUI();
     }
   }
   
@@ -1494,6 +1593,24 @@ class ProcessManager {
       this.settingsContainer.add(inputBar);
     }
     
+    // Input prompt if assigning shortcut
+    if (this.isAssigningShortcut) {
+      const inputBar = new BoxRenderable(this.renderer, {
+        id: 'input-bar',
+        border: ['left'],
+        borderStyle: 'single',
+        borderColor: COLORS.accent,
+        paddingLeft: 1,
+        marginBottom: 1,
+      });
+      const inputText = new TextRenderable(this.renderer, {
+        id: 'input-text',
+        content: t`${fg(COLORS.textDim)('Press a key to assign as shortcut for')} ${fg(COLORS.accent)(this.shortcutScriptName)} ${fg(COLORS.textDim)('(esc to cancel)')}`,
+      });
+      inputBar.add(inputText);
+      this.settingsContainer.add(inputBar);
+    }
+    
     // Combined content panel with all sections
     const contentPanel = new BoxRenderable(this.renderer, {
       id: 'content-panel',
@@ -1556,16 +1673,31 @@ class ProcessManager {
     
     contentPanel.add(leftColumn);
     
-    // Right column - Scripts list
+    // Middle column - Quick Commands
+    const shortcutsBox = new BoxRenderable(this.renderer, {
+      id: 'shortcuts-box',
+      flexDirection: 'column',
+      border: true,
+      borderStyle: 'rounded',
+      borderColor: this.settingsSection === 'shortcuts' ? COLORS.borderFocused : COLORS.border,
+      title: ' Quick Commands ',
+      titleAlignment: 'left',
+      flexGrow: 1,
+      padding: 1,
+    });
+    this.buildShortcutsSectionContent(shortcutsBox);
+    contentPanel.add(shortcutsBox);
+    
+    // Right column - Script List
     const scriptsBox = new BoxRenderable(this.renderer, {
       id: 'scripts-box',
       flexDirection: 'column',
       border: true,
       borderStyle: 'rounded',
       borderColor: this.settingsSection === 'scripts' ? COLORS.borderFocused : COLORS.border,
-      title: ' Scripts ',
+      title: ' Script List ',
       titleAlignment: 'left',
-      flexGrow: 2,
+      flexGrow: 1,
       padding: 1,
     });
     this.buildScriptsSectionContent(scriptsBox);
@@ -1586,19 +1718,27 @@ class ProcessManager {
       gap: 2,
     });
     
-    const shortcuts = this.isAddingPattern
-      ? [
-          { key: 'enter', desc: 'save' },
-          { key: 'esc', desc: 'cancel' },
-        ]
-      : [
-          { key: 'tab', desc: 'section' },
-          { key: 'space', desc: 'toggle' },
-          { key: 'i', desc: 'add ignore' },
-          { key: 'n', desc: 'add include' },
-          { key: 'd', desc: 'delete' },
-          { key: 'esc', desc: 'back' },
-        ];
+    let shortcuts;
+    if (this.isAddingPattern) {
+      shortcuts = [
+        { key: 'enter', desc: 'save' },
+        { key: 'esc', desc: 'cancel' },
+      ];
+    } else if (this.isAssigningShortcut) {
+      shortcuts = [
+        { key: 'any key', desc: 'assign' },
+        { key: 'esc', desc: 'cancel' },
+      ];
+    } else {
+      shortcuts = [
+        { key: 'tab', desc: 'section' },
+        { key: 'space', desc: this.settingsSection === 'shortcuts' ? 'assign' : 'toggle' },
+        { key: 'i', desc: 'add ignore' },
+        { key: 'n', desc: 'add include' },
+        { key: 'd', desc: 'delete' },
+        { key: 'esc', desc: 'back' },
+      ];
+    }
     
     shortcuts.forEach(({ key, desc }) => {
       const shortcut = new TextRenderable(this.renderer, {
@@ -1679,6 +1819,38 @@ class ProcessManager {
     }
   }
   
+  buildShortcutsSectionContent(container) {
+    const shortcuts = this.config.shortcuts || {};
+    
+    // Helper to find shortcut key for a script
+    const getShortcutKey = (scriptName) => {
+      for (const [key, name] of Object.entries(shortcuts)) {
+        if (name === scriptName) return key;
+      }
+      return null;
+    };
+    
+    this.allScripts.forEach((script, idx) => {
+      const isFocused = this.settingsSection === 'shortcuts' && idx === this.settingsIndex;
+      const indicator = isFocused ? '>' : ' ';
+      const shortcutKey = getShortcutKey(script.name);
+      const processColor = this.processColors.get(script.name) || COLORS.text;
+      
+      let content;
+      if (shortcutKey) {
+        content = t`${fg(isFocused ? COLORS.accent : COLORS.textDim)(indicator)} ${fg(COLORS.warning)(`[${shortcutKey}]`)} ${fg(processColor)(script.displayName)}`;
+      } else {
+        content = t`${fg(isFocused ? COLORS.accent : COLORS.textDim)(indicator)} ${fg(COLORS.textDim)('[ ]')} ${fg(processColor)(script.displayName)}`;
+      }
+      
+      const line = new TextRenderable(this.renderer, {
+        id: `shortcut-item-${idx}`,
+        content: content,
+      });
+      container.add(line);
+    });
+  }
+  
   buildScriptsSectionContent(container) {
     const ignorePatterns = this.config.ignore || [];
     
@@ -1691,9 +1863,16 @@ class ProcessManager {
       const processColor = this.processColors.get(script.name) || COLORS.text;
       const nameColor = isIgnored ? COLORS.textDim : processColor;
       
+      let content;
+      if (isIgnored) {
+        content = t`${fg(isFocused ? COLORS.accent : COLORS.textDim)(indicator)} ${fg(checkColor)(checkbox)} ${fg(nameColor)(script.displayName)} ${fg(COLORS.textDim)('(ignored)')}`;
+      } else {
+        content = t`${fg(isFocused ? COLORS.accent : COLORS.textDim)(indicator)} ${fg(checkColor)(checkbox)} ${fg(nameColor)(script.displayName)}`;
+      }
+      
       const line = new TextRenderable(this.renderer, {
         id: `script-toggle-${idx}`,
-        content: t`${fg(isFocused ? COLORS.accent : COLORS.textDim)(indicator)} ${fg(checkColor)(checkbox)} ${fg(nameColor)(script.displayName)}${isIgnored ? t` ${fg(COLORS.textDim)('(ignored)')}` : ''}`,
+        content: content,
       });
       container.add(line);
     });
@@ -1723,6 +1902,15 @@ class ProcessManager {
       this.countdownInterval = null;
     }
     
+    // Clean up command overlay process if running
+    if (this.commandOverlayProcess && this.commandOverlayProcess.pid) {
+      try {
+        kill(this.commandOverlayProcess.pid, 'SIGKILL');
+      } catch (err) {
+        // Ignore
+      }
+    }
+    
     for (const [scriptName, proc] of this.processRefs.entries()) {
       try {
         if (proc.pid) {
@@ -1732,6 +1920,75 @@ class ProcessManager {
         // Ignore
       }
     }
+  }
+  
+  executeCommand(scriptName) {
+    // Initialize overlay state
+    this.showCommandOverlay = true;
+    this.commandOverlayOutput = [];
+    this.commandOverlayScript = scriptName;
+    this.commandOverlayStatus = 'running';
+    
+    // Spawn the process
+    const proc = spawn('npm', ['run', scriptName], {
+      env: {
+        ...process.env,
+        FORCE_COLOR: '1',
+        COLORTERM: 'truecolor',
+      },
+      shell: true,
+    });
+    
+    this.commandOverlayProcess = proc;
+    
+    proc.stdout.on('data', (data) => {
+      const text = data.toString();
+      const lines = text.split('\n');
+      lines.forEach(line => {
+        if (line.trim()) {
+          this.commandOverlayOutput.push(line);
+          this.buildRunningUI();
+        }
+      });
+    });
+    
+    proc.stderr.on('data', (data) => {
+      const text = data.toString();
+      const lines = text.split('\n');
+      lines.forEach(line => {
+        if (line.trim()) {
+          this.commandOverlayOutput.push(line);
+          this.buildRunningUI();
+        }
+      });
+    });
+    
+    proc.on('exit', (code) => {
+      this.commandOverlayStatus = code === 0 ? 'exited' : 'crashed';
+      this.commandOverlayOutput.push('');
+      this.commandOverlayOutput.push(`Process exited with code ${code}`);
+      this.commandOverlayProcess = null;
+      this.buildRunningUI();
+    });
+    
+    this.buildRunningUI();
+  }
+  
+  closeCommandOverlay() {
+    // Kill the process if still running
+    if (this.commandOverlayProcess && this.commandOverlayProcess.pid) {
+      try {
+        kill(this.commandOverlayProcess.pid, 'SIGKILL');
+      } catch (err) {
+        // Ignore
+      }
+    }
+    
+    this.showCommandOverlay = false;
+    this.commandOverlayOutput = [];
+    this.commandOverlayScript = '';
+    this.commandOverlayStatus = 'running';
+    this.commandOverlayProcess = null;
   }
 
   buildSelectionUI() {
@@ -2335,6 +2592,88 @@ class ProcessManager {
     parent.add(overlay);
   }
   
+  // Build command output overlay
+  buildCommandOverlay(parent) {
+    const statusIcon = this.commandOverlayStatus === 'running' ? '●' : 
+                      this.commandOverlayStatus === 'exited' ? '✓' : '✖';
+    const statusColor = this.commandOverlayStatus === 'running' ? COLORS.warning : 
+                       this.commandOverlayStatus === 'exited' ? COLORS.success : COLORS.error;
+    const title = ` ${statusIcon} ${this.commandOverlayScript} `;
+    
+    // Create centered overlay with scrollable content
+    const overlay = new BoxRenderable(this.renderer, {
+      id: 'command-overlay',
+      position: 'absolute',
+      top: '10%',
+      left: '10%',
+      width: '80%',
+      height: '80%',
+      backgroundColor: COLORS.bg,
+      border: true,
+      borderStyle: 'rounded',
+      borderColor: statusColor,
+      title: title,
+      padding: 0,
+      flexDirection: 'column',
+    });
+    
+    // Scrollable output content
+    const outputBox = new ScrollBoxRenderable(this.renderer, {
+      id: 'command-output',
+      height: Math.floor(this.renderer.height * 0.8) - 4,
+      scrollX: false,
+      scrollY: true,
+      focusable: true,
+      style: {
+        rootOptions: {
+          flexGrow: 1,
+          paddingLeft: 1,
+          paddingRight: 1,
+          backgroundColor: COLORS.bg,
+        },
+        contentOptions: {
+          backgroundColor: COLORS.bg,
+          width: '100%',
+        },
+      },
+    });
+    
+    // Add output lines
+    this.commandOverlayOutput.forEach((line, idx) => {
+      const outputLine = new TextRenderable(this.renderer, {
+        id: `cmd-output-${idx}`,
+        content: line,
+      });
+      outputBox.content.add(outputLine);
+    });
+    
+    // Auto-scroll to bottom
+    if (outputBox.scrollTo) {
+      outputBox.scrollTo({ x: 0, y: Number.MAX_SAFE_INTEGER });
+    }
+    
+    overlay.add(outputBox);
+    
+    // Footer hint
+    const hintBar = new BoxRenderable(this.renderer, {
+      id: 'command-hint-bar',
+      border: ['top'],
+      borderStyle: 'single',
+      borderColor: COLORS.border,
+      paddingTop: 1,
+      paddingLeft: 1,
+    });
+    
+    const hint = new TextRenderable(this.renderer, {
+      id: 'command-hint',
+      content: t`${fg(COLORS.textDim)('Press')} ${fg(COLORS.accent)('Esc')} ${fg(COLORS.textDim)('to close')}`,
+    });
+    hintBar.add(hint);
+    overlay.add(hintBar);
+    
+    parent.add(overlay);
+  }
+  
   buildRunningUI() {
     // Save scroll positions before destroying
     for (const [paneId, scrollBox] of this.paneScrollBoxes.entries()) {
@@ -2560,6 +2899,11 @@ class ProcessManager {
     // Add command palette overlay if active
     if (this.showSplitMenu) {
       this.buildSplitMenuOverlay(mainContainer);
+    }
+    
+    // Add command output overlay if active
+    if (this.showCommandOverlay) {
+      this.buildCommandOverlay(mainContainer);
     }
     
     this.renderer.root.add(mainContainer);

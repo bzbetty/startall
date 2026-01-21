@@ -56,9 +56,13 @@ Traditional solutions fall short:
 - **Quick process toggle**: Use number keys `1-9` for instant visibility control
 
 ### 🔧 Advanced Controls
+- **Quick Commands**: Assign keyboard shortcuts to run scripts on-demand
+  - Press assigned key to run command in a popup overlay
+  - Perfect for build scripts, tests, or any short-running command
+  - Configure in settings (`o` → Quick Commands section)
 - **Interactive input mode**: Send commands to running processes via stdin (`i`)
   - Perfect for dev servers that accept commands (Vite, Rust watch, etc.)
-- **Settings panel**: Configure ignore/include patterns (`o`)
+- **Settings panel**: Configure ignore/include patterns, shortcuts, and more (`o`)
   - Wildcard support (`*`) for pattern matching
   - Per-script visibility toggles
 - **Keyboard & mouse support**: Full keyboard navigation + mouse clicking/scrolling
@@ -103,6 +107,7 @@ That's it! The TUI will:
 - `s` - Stop/start selected process
 - `r` - Restart selected process
 - `i` - Send input to selected process (interactive mode)
+- `a-z` - Run assigned quick command (if configured)
 
 *Pane Management:*
 - `\` - Open command palette
@@ -137,12 +142,16 @@ That's it! The TUI will:
 - `Ctrl+C` - Force quit
 
 **Settings Screen:**
-- `Tab`/`←`/`→` - Switch sections (Ignore/Include/Scripts)
+- `Tab`/`←`/`→` - Switch sections (Display/Ignore/Include/Quick Commands/Script List)
 - `↑`/`↓` - Navigate items
-- `a` - Add new pattern (Ignore/Include sections)
-- `d` or `Backspace` - Delete pattern
-- `Space` or `Enter` - Toggle script (Scripts section)
+- `i` - Add new ignore pattern
+- `n` - Add new include pattern
+- `Space` or `Enter` - Toggle option (Display) / Assign shortcut (Quick Commands) / Toggle ignore (Script List)
+- `d` or `Backspace` - Delete pattern or shortcut
 - `Esc` or `q` - Return to previous screen
+
+**Quick Commands Overlay:**
+- `Esc` - Close overlay and stop command (if running)
 
 ## Why Build This?
 
@@ -164,12 +173,19 @@ Existing tools either:
   {
     "defaultSelection": ["frontend", "backend"],
     "include": ["dev:*"],
-    "ignore": ["*:test"]
+    "ignore": ["*:test"],
+    "shortcuts": {
+      "b": "build",
+      "t": "test",
+      "l": "lint"
+    }
   }
   ```
+  - `defaultSelection`: scripts to auto-select on startup
   - `include` (optional): if defined, only scripts matching these patterns are shown
   - `ignore`: scripts matching these patterns are hidden
-  - Both support wildcards (`*`)
+  - `shortcuts`: keyboard shortcuts for running commands on-demand
+  - All patterns support wildcards (`*`)
 
 ## Roadmap
 

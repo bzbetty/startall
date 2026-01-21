@@ -1,12 +1,10 @@
 {
   "defaultSelection": [
-    "test",
     "demo:frontend",
     "demo:backend",
     "demo:worker",
     "demo:worker2",
     "demo:errors",
-    "demo:build",
     "demo:longtext",
     "demo:cmd"
   ],
@@ -80,5 +78,10 @@
         ]
       }
     ]
-  }
+  },
+  "shortcuts": {
+    "b": "demo:build",
+    "[": "test"
+  },
+  "showLineNumbers": false
 }
