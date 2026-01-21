@@ -15,7 +15,8 @@
     "demo:worker2": "node -e \"setInterval(() => console.log('Processing jobs...'), 100)\"",
     "demo:errors": "node -e \"setInterval(() => { console.log('\\x1b[32mOK: All good\\x1b[0m'); console.log('\\x1b[33mWARN: Deprecated API used\\x1b[0m'); console.log('\\x1b[31mERROR: Connection failed\\x1b[0m'); console.log('Normal log message'); }, 2000)\"",
     "demo:build": "node -e \"let i=0; setInterval(() => { i++; if(i%5===0) console.log('\\x1b[31mError: Type mismatch in file.ts:42\\x1b[0m'); else if(i%3===0) console.log('\\x1b[33mWarning: Unused variable\\x1b[0m'); else console.log('\\x1b[36mCompiling module ' + i + '...\\x1b[0m'); }, 800)\"",
-    "demo:longtext": "node -e \"setInterval(() => { console.log('\\x1b[36m[2024-01-20T12:34:56.789Z] Executing SQL query: SELECT users.id, users.name, users.email, orders.order_id, orders.total, products.name FROM users INNER JOIN orders ON users.id = orders.user_id LEFT JOIN products ON orders.product_id = products.id WHERE users.created_at > NOW() - INTERVAL 30 DAY AND orders.status = \\'completed\\' ORDER BY orders.total DESC LIMIT 100\\x1b[0m'); console.log('Fetched 42 records in 127ms'); }, 1500)\""
+    "demo:longtext": "node -e \"setInterval(() => { console.log('\\x1b[36m[2024-01-20T12:34:56.789Z] Executing SQL query: SELECT users.id, users.name, users.email, orders.order_id, orders.total, products.name FROM users INNER JOIN orders ON users.id = orders.user_id LEFT JOIN products ON orders.product_id = products.id WHERE users.created_at > NOW() - INTERVAL 30 DAY AND orders.status = \\'completed\\' ORDER BY orders.total DESC LIMIT 100\\x1b[0m'); console.log('Fetched 42 records in 127ms'); }, 1500)\"",
+    "demo:cmd": "cmd"
   },
   "keywords": [],
   "author": "",

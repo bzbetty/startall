@@ -1,13 +1,14 @@
 {
   "defaultSelection": [
     "test",
-    "demo:worker2",
     "demo:frontend",
-    "demo:worker",
     "demo:backend",
-    "demo:build",
+    "demo:worker",
+    "demo:worker2",
     "demo:errors",
-    "demo:longtext"
+    "demo:build",
+    "demo:longtext",
+    "demo:cmd"
   ],
   "paneLayout": {
     "type": "split",
@@ -50,9 +51,18 @@
             "type": "pane",
             "name": "",
             "processes": [],
-            "hidden": [],
+            "hidden": [
+              "demo:backend",
+              "demo:worker",
+              "demo:worker2",
+              "demo:errors",
+              "demo:build",
+              "demo:longtext",
+              "test",
+              "demo:frontend"
+            ],
             "filter": "",
-            "colorFilter": "red"
+            "colorFilter": null
           },
           {
             "type": "pane",
