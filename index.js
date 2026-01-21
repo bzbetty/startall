@@ -1825,58 +1825,15 @@ class ProcessManager {
     const outputHeight = Math.max(3, height - 2);
     let linesToShow = this.isPaused ? lines : lines.slice(-outputHeight);
     
-    // Use full terminal width for padding - simpler and ensures complete clearing
-    // Each pane will pad to full width, excess will be clipped by container
-    const approxPaneWidth = this.renderer.width;
-    
     // Add lines in reverse order (newest first)
     for (let i = linesToShow.length - 1; i >= 0; i--) {
       const line = linesToShow[i];
       const processColor = this.processColors.get(line.process) || COLORS.text;
       
-      const maxWidth = Math.max(20, this.renderer.width / 2 - line.process.length - 10);
-      const visibleLength = stripAnsi(line.text).length;
-      let truncatedText = line.text;
-      if (visibleLength > maxWidth) {
-        let visible = 0;
-        const ansiRegex = /\x1b\[[0-9;]*m/g;
-        let lastIndex = 0;
-        let result = '';
-        let match;
-        const text = line.text;
-        while ((match = ansiRegex.exec(text)) !== null) {
-          const before = text.slice(lastIndex, match.index);
-          for (const char of before) {
-            if (visible >= maxWidth - 3) break;
-            result += char;
-            visible++;
-          }
-          if (visible >= maxWidth - 3) break;
-          result += match[0];
-          lastIndex = ansiRegex.lastIndex;
-        }
-        if (visible < maxWidth - 3) {
-          const remaining = text.slice(lastIndex);
-          for (const char of remaining) {
-            if (visible >= maxWidth - 3) break;
-            result += char;
-            visible++;
-          }
-        }
-        truncatedText = result + '\x1b[0m...';
-      }
-      
-      // Get visible length of current line and pad to fill width
-      const linePrefix = `[${line.process}] `;
-      const currentLength = linePrefix.length + stripAnsi(truncatedText).length;
-      
-      // Pad with spaces to fill the width
-      const paddingNeeded = Math.max(0, approxPaneWidth - currentLength);
-      const padding = ' '.repeat(paddingNeeded);
-      
+      // No truncation - let OpenTUI handle text wrapping naturally
       const outputLine = new TextRenderable(this.renderer, {
         id: `output-${pane.id}-${i}`,
-        content: t`${fg(processColor)(`[${line.process}]`)} ${truncatedText}${padding}`,
+        content: t`${fg(processColor)(`[${line.process}]`)} ${line.text}`,
         bg: '#000000', // Black background for pane content
       });
       
@@ -1888,7 +1845,7 @@ class ProcessManager {
     for (let j = 0; j < emptyLinesNeeded; j++) {
       const emptyLine = new TextRenderable(this.renderer, {
         id: `empty-${pane.id}-${j}`,
-        content: ' '.repeat(approxPaneWidth), // Fill entire width with spaces
+        content: ' ',
         bg: '#000000', // Black background for empty lines
       });
       

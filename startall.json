@@ -6,7 +6,8 @@
     "demo:worker",
     "demo:backend",
     "demo:build",
-    "demo:errors"
+    "demo:errors",
+    "demo:longtext"
   ],
   "paneLayout": {
     "type": "split",
