@@ -2533,10 +2533,9 @@ class ProcessManager {
       { key: 'p', desc: 'pause', color: COLORS.warning },
       { key: '/', desc: 'filter', color: COLORS.cyan },
       { key: 'c', desc: 'color', color: COLORS.magenta },
-      { key: '#', desc: 'lines', color: COLORS.textDim },
-      { key: 't', desc: 'time', color: COLORS.textDim },
       { key: 's', desc: 'stop', color: COLORS.error },
       { key: 'r', desc: 'restart', color: COLORS.success },
+      { key: 'o', desc: 'settings', color: COLORS.magenta },
       { key: 'q', desc: 'quit', color: COLORS.error },
     ];
     
