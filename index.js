@@ -357,6 +357,10 @@ class ProcessManager {
     this.splitMode = false;  // Whether waiting for split command after Ctrl+b
     this.showSplitMenu = false;  // Whether to show the command palette
     this.splitMenuIndex = 0;  // Selected item in split menu
+    this.paneScrollPositions = new Map();  // Store scroll positions per pane ID
+    this.paneScrollBoxes = new Map();  // Store ScrollBox references per pane ID
+    this.paneFilterState = new Map();  // Track filter state per pane to detect changes
+    this.paneLineCount = new Map();  // Track how many lines we've rendered per pane
     
     // Assign colors to each script
     this.processColors = new Map();
@@ -1811,9 +1815,94 @@ class ProcessManager {
   }
   
   updateRunningUI() {
-    // Just rebuild the entire UI - simpler and more reliable
-    // OpenTUI doesn't have great incremental update support anyway
-    this.buildRunningUI();
+    // Update existing panes instead of rebuilding everything
+    if (this.paneScrollBoxes.size > 0) {
+      // Update each pane's content
+      for (const [paneId, scrollBox] of this.paneScrollBoxes.entries()) {
+        const pane = findPaneById(this.paneRoot, paneId);
+        if (pane && scrollBox && scrollBox.content) {
+          // Check if filter state changed or if paused (requires rebuild)
+          const currentFilterState = JSON.stringify({
+            filter: pane.filter || '',
+            hidden: pane.hidden || [],
+            processes: pane.processes || [],
+            colorFilter: pane.colorFilter || null,
+          });
+          const previousFilterState = this.paneFilterState.get(paneId);
+          const filterChanged = currentFilterState !== previousFilterState;
+          const needsRebuild = filterChanged || this.isPaused;
+          
+          if (needsRebuild) {
+            // Filter changed - need to rebuild all content
+            this.paneFilterState.set(paneId, currentFilterState);
+            
+            // Remove all children
+            if (scrollBox.content.children) {
+              while (scrollBox.content.children.length > 0) {
+                const child = scrollBox.content.children[0];
+                if (child && child.id) {
+                  scrollBox.content.remove(child.id);
+                } else {
+                  break;
+                }
+              }
+            }
+            
+            // Rebuild all content
+            const height = scrollBox.height || this.renderer.height - 6;
+            this.buildPaneOutput(pane, scrollBox.content, height);
+            
+            // Update line count after rebuild
+            const lines = this.getOutputLinesForPane(pane);
+            this.paneLineCount.set(paneId, lines.length);
+            
+            // Auto-scroll to bottom after filter change
+            if (!this.isPaused) {
+              scrollBox.scrollTo({ x: 0, y: Number.MAX_SAFE_INTEGER });
+            }
+          } else {
+            // No filter change - just append new lines
+            const lines = this.getOutputLinesForPane(pane);
+            const lastRenderedCount = this.paneLineCount.get(paneId) || 0;
+            
+            if (lines.length > lastRenderedCount) {
+              const newLines = lines.slice(lastRenderedCount);
+              
+              for (let i = 0; i < newLines.length; i++) {
+                const line = newLines[i];
+                const lineIndex = lastRenderedCount + i;
+                const processColor = this.processColors.get(line.process) || COLORS.text;
+                const trimmedText = line.text.trim();
+                
+                const outputLine = new TextRenderable(this.renderer, {
+                  id: `output-${pane.id}-${lineIndex}`,
+                  content: t`${fg(processColor)(`[${line.process}]`)} ${trimmedText}`,
+                  bg: '#000000',
+                });
+                
+                scrollBox.content.add(outputLine);
+              }
+              
+              // Update line count
+              this.paneLineCount.set(paneId, lines.length);
+              
+              // Auto-scroll to bottom if not paused
+              if (!this.isPaused) {
+                scrollBox.scrollTo({ x: 0, y: Number.MAX_SAFE_INTEGER });
+              }
+            }
+          }
+          
+          // Update scrollbar visibility based on pause state
+          if (scrollBox.verticalScrollBar) {
+            scrollBox.verticalScrollBar.width = this.isPaused ? 1 : 0;
+          }
+        }
+      }
+    } else {
+      // First time or no panes exist - do full rebuild
+      this.buildRunningUI();
+    }
   }
   
   // Build a single pane's output area
@@ -1821,35 +1910,23 @@ class ProcessManager {
     const isFocused = pane.id === this.focusedPaneId;
     const lines = this.getOutputLinesForPane(pane);
     
-    // Calculate visible lines - use global pause state
-    const outputHeight = Math.max(3, height - 2);
-    let linesToShow = this.isPaused ? lines : lines.slice(-outputHeight);
+    // Don't slice - show all lines and let ScrollBox handle scrolling
+    const linesToShow = lines;
     
-    // Add lines in reverse order (newest first)
-    for (let i = linesToShow.length - 1; i >= 0; i--) {
+    // Add lines (oldest first, so newest is at bottom)
+    for (let i = 0; i < linesToShow.length; i++) {
       const line = linesToShow[i];
       const processColor = this.processColors.get(line.process) || COLORS.text;
       
-      // No truncation - let OpenTUI handle text wrapping naturally
+      // Trim whitespace and let text wrap naturally - ScrollBox will handle overflow
+      const trimmedText = line.text.trim();
       const outputLine = new TextRenderable(this.renderer, {
         id: `output-${pane.id}-${i}`,
-        content: t`${fg(processColor)(`[${line.process}]`)} ${line.text}`,
+        content: t`${fg(processColor)(`[${line.process}]`)} ${trimmedText}`,
         bg: '#000000', // Black background for pane content
       });
       
       container.add(outputLine);
-    }
-    
-    // Fill remaining vertical space with blank lines
-    const emptyLinesNeeded = Math.max(0, outputHeight - linesToShow.length);
-    for (let j = 0; j < emptyLinesNeeded; j++) {
-      const emptyLine = new TextRenderable(this.renderer, {
-        id: `empty-${pane.id}-${j}`,
-        content: ' ',
-        bg: '#000000', // Black background for empty lines
-      });
-      
-      container.add(emptyLine);
     }
   }
   
@@ -1900,22 +1977,54 @@ class ProcessManager {
       backgroundColor: '#000000', // Black background for pane container
     });
     
-    // Output content - use BoxRenderable that fills remaining space
+    // Output content - use ScrollBox to handle text wrapping properly
     // Use passed height or calculate default for line count calculation
     const height = availableHeight ? Math.max(5, availableHeight - 2) : Math.max(5, this.renderer.height - 6);
     
-    const outputBox = new BoxRenderable(this.renderer, {
+    const outputBox = new ScrollBoxRenderable(this.renderer, {
       id: `pane-output-${pane.id}`,
-      flexDirection: 'column',
-      flexGrow: 1,
-      flexShrink: 1,
-      flexBasis: 0,
-      overflow: 'hidden',
-      paddingLeft: 1,
-      backgroundColor: '#000000', // Black background for pane
+      height: height,
+      scrollX: false, // Disable horizontal scrollbar entirely
+      scrollY: true,  // Enable vertical scrolling
+      focusable: true, // Enable mouse interactions and keyboard scrolling
+      style: {
+        rootOptions: {
+          flexGrow: 1,
+          flexShrink: 1,
+          flexBasis: 0,
+          paddingLeft: 1,
+          backgroundColor: '#000000',
+        },
+        contentOptions: {
+          backgroundColor: '#000000',
+          width: '100%', // Fill container width for proper text wrapping
+        },
+      },
     });
     
-    this.buildPaneOutput(pane, outputBox, height);
+    // Show scrollbar when paused, hide when not paused
+    if (outputBox.verticalScrollBar) {
+      outputBox.verticalScrollBar.width = this.isPaused ? 1 : 0;
+    }
+    
+    // Store ScrollBox reference for this pane
+    this.paneScrollBoxes.set(pane.id, outputBox);
+    
+    this.buildPaneOutput(pane, outputBox.content, height);
+    
+    // Restore or set scroll position
+    setTimeout(() => {
+      if (!outputBox || !outputBox.scrollTo) return;
+      
+      if (this.isPaused && this.paneScrollPositions.has(pane.id)) {
+        // Restore saved scroll position when paused
+        const savedPos = this.paneScrollPositions.get(pane.id);
+        outputBox.scrollTo(savedPos);
+      } else if (!this.isPaused) {
+        // Auto-scroll to bottom when not paused
+        outputBox.scrollTo({ x: 0, y: Number.MAX_SAFE_INTEGER });
+      }
+    }, 0);
     
     paneContainer.add(outputBox);
     return paneContainer;
@@ -2011,6 +2120,16 @@ class ProcessManager {
   }
   
   buildRunningUI() {
+    // Save scroll positions before destroying
+    for (const [paneId, scrollBox] of this.paneScrollBoxes.entries()) {
+      if (scrollBox) {
+        this.paneScrollPositions.set(paneId, {
+          x: scrollBox.scrollLeft || 0,
+          y: scrollBox.scrollTop || 0,
+        });
+      }
+    }
+    
     // Remove old containers if they exist - use destroyRecursively to clean up all children
     if (this.selectionContainer) {
       this.renderer.root.remove(this.selectionContainer);
@@ -2029,8 +2148,9 @@ class ProcessManager {
       this.runningContainer.destroyRecursively();
       this.runningContainer = null;
     }
-    // Clear outputBox reference since it was destroyed with runningContainer
+    // Clear outputBox reference and scrollbox map since they were destroyed
     this.outputBox = null;
+    this.paneScrollBoxes.clear();
     
     // Create main container - full screen with black background
     const mainContainer = new BoxRenderable(this.renderer, {
