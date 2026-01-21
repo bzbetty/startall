@@ -379,6 +379,10 @@ class ProcessManager {
     this.commandOverlayScript = '';  // Script name being executed
     this.commandOverlayStatus = 'running';  // 'running' | 'exited' | 'crashed'
     this.commandOverlayProcess = null;  // Process reference
+    
+    // Run command modal state
+    this.showRunCommandModal = false;  // Whether the run command picker is visible
+    this.runCommandModalIndex = 0;  // Selected index in the modal
     this.outputBox = null;  // Reference to the output container
     this.destroyed = false;  // Flag to prevent operations after cleanup
     this.lastRenderedLineCount = 0;  // Track how many lines we've rendered
@@ -491,6 +495,12 @@ class ProcessManager {
           this.closeCommandOverlay();
           this.buildRunningUI();
         }
+        return;
+      }
+      
+      // Handle run command modal
+      if (this.showRunCommandModal) {
+        this.handleRunCommandModalInput(keyName, keyEvent);
         return;
       }
       
@@ -708,6 +718,11 @@ class ProcessManager {
             this.inputModeText = '';
             this.buildRunningUI();
           }
+        } else if (keyName === 'e') {
+          // Open run command modal
+          this.showRunCommandModal = true;
+          this.runCommandModalIndex = 0;
+          this.buildRunningUI();
         } else if (keyName && keyName.length === 1 && !keyEvent.ctrl && !keyEvent.meta && !keyEvent.shift) {
           // Check if this key is a custom shortcut
           const shortcuts = this.config.shortcuts || {};
@@ -1263,6 +1278,28 @@ class ProcessManager {
       }
       this.showSplitMenu = false;
       this.buildRunningUI();
+    }
+  }
+  
+  handleRunCommandModalInput(keyName, keyEvent) {
+    if (keyName === 'escape' || keyName === 'q') {
+      this.showRunCommandModal = false;
+      this.buildRunningUI();
+      return;
+    }
+    
+    if (keyName === 'up' || keyName === 'k') {
+      this.runCommandModalIndex = Math.max(0, this.runCommandModalIndex - 1);
+      this.buildRunningUI();
+    } else if (keyName === 'down' || keyName === 'j') {
+      this.runCommandModalIndex = Math.min(this.allScripts.length - 1, this.runCommandModalIndex + 1);
+      this.buildRunningUI();
+    } else if (keyName === 'enter' || keyName === 'return') {
+      const selectedScript = this.allScripts[this.runCommandModalIndex];
+      if (selectedScript) {
+        this.showRunCommandModal = false;
+        this.executeCommand(selectedScript.name);
+      }
     }
   }
   
@@ -2674,6 +2711,114 @@ class ProcessManager {
     parent.add(overlay);
   }
   
+  // Build run command picker modal
+  buildRunCommandModal(parent) {
+    // Create centered overlay
+    const overlay = new BoxRenderable(this.renderer, {
+      id: 'run-command-modal',
+      position: 'absolute',
+      top: '20%',
+      left: '25%',
+      width: '50%',
+      height: '60%',
+      backgroundColor: COLORS.bgLight,
+      border: true,
+      borderStyle: 'rounded',
+      borderColor: COLORS.accent,
+      title: ' Run Command ',
+      padding: 1,
+      flexDirection: 'column',
+    });
+    
+    // Scrollable list of scripts
+    const listBox = new ScrollBoxRenderable(this.renderer, {
+      id: 'run-command-list',
+      height: Math.floor(this.renderer.height * 0.6) - 4,
+      scrollX: false,
+      scrollY: true,
+      focusable: true,
+      style: {
+        rootOptions: {
+          flexGrow: 1,
+          backgroundColor: COLORS.bgLight,
+        },
+        contentOptions: {
+          backgroundColor: COLORS.bgLight,
+          width: '100%',
+        },
+      },
+    });
+    
+    this.allScripts.forEach((script, idx) => {
+      const isFocused = idx === this.runCommandModalIndex;
+      const indicator = isFocused ? '>' : ' ';
+      const bgColor = isFocused ? COLORS.bgHighlight : null;
+      const processColor = this.processColors.get(script.name) || COLORS.text;
+      
+      // Check if this script has a shortcut
+      const shortcuts = this.config.shortcuts || {};
+      let shortcutKey = null;
+      for (const [key, scriptName] of Object.entries(shortcuts)) {
+        if (scriptName === script.name) {
+          shortcutKey = key;
+          break;
+        }
+      }
+      
+      const itemContainer = new BoxRenderable(this.renderer, {
+        id: `run-cmd-item-${idx}`,
+        backgroundColor: bgColor,
+        paddingLeft: 1,
+      });
+      
+      let content;
+      if (shortcutKey) {
+        content = t`${fg(isFocused ? COLORS.accent : COLORS.textDim)(indicator)} ${fg(processColor)(script.displayName)} ${fg(COLORS.textDim)(`(${shortcutKey})`)}`;
+      } else {
+        content = t`${fg(isFocused ? COLORS.accent : COLORS.textDim)(indicator)} ${fg(processColor)(script.displayName)}`;
+      }
+      
+      const itemText = new TextRenderable(this.renderer, {
+        id: `run-cmd-text-${idx}`,
+        content: content,
+      });
+      
+      itemContainer.add(itemText);
+      listBox.content.add(itemContainer);
+    });
+    
+    // Auto-scroll to focused item
+    if (listBox.scrollTo) {
+      const lineHeight = 1;
+      const viewportHeight = Math.floor(this.renderer.height * 0.6) - 4;
+      const focusedY = this.runCommandModalIndex * lineHeight;
+      if (focusedY < listBox.scrollTop || focusedY >= listBox.scrollTop + viewportHeight) {
+        listBox.scrollTo({ x: 0, y: Math.max(0, focusedY - Math.floor(viewportHeight / 2)) });
+      }
+    }
+    
+    overlay.add(listBox);
+    
+    // Footer hint
+    const hintBar = new BoxRenderable(this.renderer, {
+      id: 'run-cmd-hint-bar',
+      border: ['top'],
+      borderStyle: 'single',
+      borderColor: COLORS.border,
+      paddingTop: 1,
+      paddingLeft: 1,
+    });
+    
+    const hint = new TextRenderable(this.renderer, {
+      id: 'run-cmd-hint',
+      content: t`${fg(COLORS.textDim)('↑/↓ navigate')}  ${fg(COLORS.accent)('Enter')} ${fg(COLORS.textDim)('run')}  ${fg(COLORS.accent)('Esc')} ${fg(COLORS.textDim)('close')}`,
+    });
+    hintBar.add(hint);
+    overlay.add(hintBar);
+    
+    parent.add(overlay);
+  }
+  
   buildRunningUI() {
     // Save scroll positions before destroying
     for (const [paneId, scrollBox] of this.paneScrollBoxes.entries()) {
@@ -2899,6 +3044,11 @@ class ProcessManager {
     // Add command palette overlay if active
     if (this.showSplitMenu) {
       this.buildSplitMenuOverlay(mainContainer);
+    }
+    
+    // Add run command modal if active
+    if (this.showRunCommandModal) {
+      this.buildRunCommandModal(mainContainer);
     }
     
     // Add command output overlay if active
