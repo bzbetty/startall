@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 
 import { createCliRenderer, TextRenderable, BoxRenderable, ScrollBoxRenderable, t, fg } from '@opentui/core';
-import { spawn } from 'child_process';
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { spawn, execSync, spawnSync } from 'child_process';
+import { readFileSync, writeFileSync, writeSync, existsSync } from 'fs';
 import { join } from 'path';
 import kill from 'tree-kill';
 import stripAnsi from 'strip-ansi';
@@ -261,6 +261,76 @@ function deserializePaneTree(data) {
   };
 }
 
+// Copy text to system clipboard
+// Tries platform-specific commands first (most reliable), then OSC 52 as fallback
+function copyToClipboard(text) {
+  let copied = false;
+  
+  // Try platform-specific clipboard commands first (most reliable)
+  try {
+    const platform = process.platform;
+    if (platform === 'win32') {
+      // PowerShell Set-Clipboard handles unicode and doesn't add trailing newline like clip.exe
+      const result = spawnSync('powershell', ['-NoProfile', '-Command', 'Set-Clipboard -Value $input'], {
+        input: text,
+        stdio: ['pipe', 'ignore', 'ignore'],
+        timeout: 3000,
+        windowsHide: true,
+      });
+      if (result.status === 0) copied = true;
+      else {
+        // Fallback to clip.exe
+        const clipResult = spawnSync('clip', [], {
+          input: text,
+          stdio: ['pipe', 'ignore', 'ignore'],
+          timeout: 3000,
+          windowsHide: true,
+        });
+        if (clipResult.status === 0) copied = true;
+      }
+    } else if (platform === 'darwin') {
+      const result = spawnSync('pbcopy', [], {
+        input: text,
+        stdio: ['pipe', 'ignore', 'ignore'],
+        timeout: 3000,
+      });
+      if (result.status === 0) copied = true;
+    } else {
+      // Linux - try xclip, then xsel, then wl-copy (Wayland)
+      for (const cmd of [
+        ['xclip', ['-selection', 'clipboard']],
+        ['xsel', ['--clipboard', '--input']],
+        ['wl-copy', []],
+      ]) {
+        try {
+          const result = spawnSync(cmd[0], cmd[1], {
+            input: text,
+            stdio: ['pipe', 'ignore', 'ignore'],
+            timeout: 3000,
+          });
+          if (result.status === 0) { copied = true; break; }
+        } catch { /* try next */ }
+      }
+    }
+  } catch {
+    // Platform commands unavailable
+  }
+  
+  // Fallback: OSC 52 escape sequence (works in many modern terminals)
+  // Write directly to fd to bypass any buffering from the TUI renderer
+  if (!copied) {
+    try {
+      const encoded = Buffer.from(text).toString('base64');
+      const osc = `\x1b]52;c;${encoded}\x1b\\`;
+      writeSync(1, osc);
+    } catch {
+      // Nothing more we can do
+    }
+  }
+  
+  return copied;
+}
+
 // Color palette (inspired by Tokyo Night theme)
 const COLORS = {
   border: '#3b4261',
@@ -276,6 +346,11 @@ const COLORS = {
   warning: '#e0af68',
   cyan: '#7dcfff',
   magenta: '#bb9af7',
+  // Copy mode colors (high contrast for visibility)
+  copyCursorBg: '#3d59a1',    // Bright blue bg for cursor line
+  copySelectBg: '#2a3a6e',    // Medium blue bg for selected range
+  copyCursorText: '#ffffff',   // White text on cursor line
+  copySelectText: '#c0caf5',   // Light text on selected lines
 };
 
 // Match string against pattern with wildcard support
@@ -428,6 +503,15 @@ class ProcessManager {
     this.paneScrollBoxes = new Map();  // Store ScrollBox references per pane ID
     this.paneFilterState = new Map();  // Track filter state per pane to detect changes
     this.paneLineCount = new Map();  // Track how many lines we've rendered per pane
+    this.uiJustRebuilt = false;  // Flag to skip redundant render after buildRunningUI
+    
+    // Copy mode state (select text to copy)
+    this.isCopyMode = false;       // Whether in copy/select mode
+    this.copyModeCursor = 0;       // Current cursor line index within visible lines
+    this.copyModeAnchor = null;    // Selection anchor (null = no selection started, number = anchor line index)
+    this.copyModeWasPaused = false; // Whether output was already paused before entering copy mode
+    this.copyFeedbackMessage = '';  // Temporary feedback message after copying
+    this.copyFeedbackTimer = null;  // Timer to clear feedback message
     
     // Assign colors to each script
     this.processColors = new Map();
@@ -613,6 +697,10 @@ class ProcessManager {
           if (pane) pane.filter = (pane.filter || '') + keyName;
           this.buildRunningUI(); // Update UI to show filter change
         }
+      }
+      // If in copy mode, handle copy mode input
+      else if (this.isCopyMode) {
+        this.handleCopyModeInput(keyName, keyEvent);
       } else {
         // Normal mode - handle commands
         if (keyName === 'q') {
@@ -766,6 +854,9 @@ class ProcessManager {
           this.showRunCommandModal = true;
           this.runCommandModalIndex = 0;
           this.buildRunningUI();
+        } else if (keyName === 'y') {
+          // Enter copy mode (select text to copy)
+          this.enterCopyMode();
         } else if (keyName && keyName.length === 1 && !keyEvent.ctrl && !keyEvent.meta && !keyEvent.shift) {
           // Check if this key is a custom shortcut
           const shortcuts = this.config.shortcuts || {};
@@ -1578,6 +1669,204 @@ class ProcessManager {
     }
   }
   
+  // Enter copy mode for the focused pane
+  enterCopyMode() {
+    if (!this.focusedPaneId) return;
+    
+    const pane = findPaneById(this.paneRoot, this.focusedPaneId);
+    if (!pane) return;
+    
+    const lines = this.getOutputLinesForPane(pane);
+    if (lines.length === 0) return;
+    
+    this.isCopyMode = true;
+    this.copyModeAnchor = null;
+    this.copyModeCursor = lines.length - 1; // Start at the last line
+    
+    // Auto-pause output so lines don't shift while selecting
+    this.copyModeWasPaused = this.isPaused;
+    if (!this.isPaused) {
+      this.isPaused = true;
+      this.updateStreamPauseState();
+    }
+    
+    // Ensure cursor is visible — save scroll position to show the last line
+    // Use MAX_SAFE_INTEGER so buildRunningUI scrolls to bottom where cursor starts
+    this.paneScrollPositions.set(this.focusedPaneId, { x: 0, y: Number.MAX_SAFE_INTEGER });
+    
+    this.buildRunningUI();
+  }
+  
+  // Exit copy mode
+  exitCopyMode() {
+    this.isCopyMode = false;
+    this.copyModeCursor = 0;
+    this.copyModeAnchor = null;
+    
+    // Restore pause state
+    if (!this.copyModeWasPaused) {
+      this.isPaused = false;
+      this.updateStreamPauseState();
+    }
+    
+    this.buildRunningUI();
+  }
+  
+  // Handle keyboard input in copy mode
+  handleCopyModeInput(keyName, keyEvent) {
+    if (!this.focusedPaneId) {
+      this.exitCopyMode();
+      return;
+    }
+    
+    const pane = findPaneById(this.paneRoot, this.focusedPaneId);
+    if (!pane) {
+      this.exitCopyMode();
+      return;
+    }
+    
+    const lines = this.getOutputLinesForPane(pane);
+    const lineCount = lines.length;
+    if (lineCount === 0) {
+      this.exitCopyMode();
+      return;
+    }
+    
+    if (keyName === 'escape' || keyName === 'q') {
+      this.exitCopyMode();
+    } else if (keyName === 'up' || keyName === 'k') {
+      this.copyModeCursor = Math.max(0, this.copyModeCursor - 1);
+      this.scrollCopyModeCursorIntoView();
+      this.buildRunningUI();
+    } else if (keyName === 'down' || keyName === 'j') {
+      this.copyModeCursor = Math.min(lineCount - 1, this.copyModeCursor + 1);
+      this.scrollCopyModeCursorIntoView();
+      this.buildRunningUI();
+    } else if (keyName === 'home' || (keyName === 'g' && !keyEvent.shift)) {
+      this.copyModeCursor = 0;
+      this.scrollCopyModeCursorIntoView();
+      this.buildRunningUI();
+    } else if (keyName === 'end' || keyName === 'G') {
+      this.copyModeCursor = lineCount - 1;
+      this.scrollCopyModeCursorIntoView();
+      this.buildRunningUI();
+    } else if (keyName === 'pageup') {
+      const scrollBox = this.paneScrollBoxes.get(this.focusedPaneId);
+      const pageSize = (scrollBox?.height || 20);
+      this.copyModeCursor = Math.max(0, this.copyModeCursor - pageSize);
+      this.scrollCopyModeCursorIntoView();
+      this.buildRunningUI();
+    } else if (keyName === 'pagedown') {
+      const scrollBox = this.paneScrollBoxes.get(this.focusedPaneId);
+      const pageSize = (scrollBox?.height || 20);
+      this.copyModeCursor = Math.min(lineCount - 1, this.copyModeCursor + pageSize);
+      this.scrollCopyModeCursorIntoView();
+      this.buildRunningUI();
+    } else if (keyName === 'space') {
+      // Toggle selection anchor
+      if (this.copyModeAnchor === null) {
+        // Start selection from current cursor position
+        this.copyModeAnchor = this.copyModeCursor;
+      } else {
+        // Clear selection
+        this.copyModeAnchor = null;
+      }
+      this.buildRunningUI();
+    } else if (keyName === 'enter' || keyName === 'return' || keyName === 'y') {
+      // Copy selected lines (or current line if no selection)
+      this.copySelectedLines();
+    }
+  }
+  
+  // Compute scroll position to keep cursor visible and save to paneScrollPositions.
+  // buildRunningUI() will restore this position after rebuilding the scrollbox.
+  scrollCopyModeCursorIntoView() {
+    const cursorY = this.copyModeCursor;
+    
+    // Get current scroll position and viewport size from either live scrollBox or saved state
+    const scrollBox = this.paneScrollBoxes.get(this.focusedPaneId);
+    const savedPos = this.paneScrollPositions.get(this.focusedPaneId);
+    const viewportHeight = scrollBox?.height || 20;
+    const currentScrollY = scrollBox?.scrollTop ?? savedPos?.y ?? 0;
+    
+    let newY = currentScrollY;
+    
+    // If cursor is above the viewport, scroll up to show it
+    if (cursorY < currentScrollY) {
+      newY = cursorY;
+    }
+    // If cursor is below the viewport, scroll down to show it
+    else if (cursorY >= currentScrollY + viewportHeight) {
+      newY = cursorY - viewportHeight + 1;
+    }
+    
+    // Save computed position — buildRunningUI will restore it since we're paused
+    this.paneScrollPositions.set(this.focusedPaneId, { x: 0, y: newY });
+  }
+  
+  // Copy the selected lines to clipboard
+  copySelectedLines() {
+    const pane = findPaneById(this.paneRoot, this.focusedPaneId);
+    if (!pane) {
+      this.exitCopyMode();
+      return;
+    }
+    
+    const lines = this.getOutputLinesForPane(pane);
+    if (lines.length === 0) {
+      this.exitCopyMode();
+      return;
+    }
+    
+    // Determine range to copy
+    let startIdx, endIdx;
+    if (this.copyModeAnchor !== null) {
+      startIdx = Math.min(this.copyModeAnchor, this.copyModeCursor);
+      endIdx = Math.max(this.copyModeAnchor, this.copyModeCursor);
+    } else {
+      // No selection - copy just the current line
+      startIdx = this.copyModeCursor;
+      endIdx = this.copyModeCursor;
+    }
+    
+    // Clamp to valid range
+    startIdx = Math.max(0, startIdx);
+    endIdx = Math.min(lines.length - 1, endIdx);
+    
+    const lineCount = endIdx - startIdx + 1;
+    
+    // Build text to copy (strip ANSI codes for clean clipboard text)
+    const textToCopy = lines
+      .slice(startIdx, endIdx + 1)
+      .map(line => stripAnsi(line.text.trim()))
+      .join('\n');
+    
+    let success = false;
+    if (textToCopy) {
+      success = copyToClipboard(textToCopy);
+    }
+    
+    this.exitCopyMode();
+    
+    // Show feedback message
+    this.showCopyFeedback(success ? `Copied ${lineCount} line${lineCount > 1 ? 's' : ''}!` : `Copied ${lineCount} line${lineCount > 1 ? 's' : ''} (clipboard may need OSC 52)`);
+  }
+  
+  // Show a temporary feedback message in the footer
+  showCopyFeedback(message) {
+    if (this.copyFeedbackTimer) {
+      clearTimeout(this.copyFeedbackTimer);
+    }
+    this.copyFeedbackMessage = message;
+    this.buildRunningUI();
+    
+    this.copyFeedbackTimer = setTimeout(() => {
+      this.copyFeedbackMessage = '';
+      this.copyFeedbackTimer = null;
+      this.buildRunningUI();
+    }, 2000);
+  }
+  
   // Check if a process is visible in the focused pane
   isProcessVisibleInPane(scriptName, pane) {
     if (!pane) return true;
@@ -2291,6 +2580,11 @@ class ProcessManager {
       // Settings UI is rebuilt on each input
       // No-op here as buildSettingsUI handles everything
     } else if (this.phase === 'running') {
+      // Skip redundant render if buildRunningUI() was already called this tick
+      if (this.uiJustRebuilt) {
+        this.uiJustRebuilt = false;
+        return;
+      }
       // For running phase, only update output, don't rebuild entire UI
       this.updateRunningUI();
     }
@@ -2644,6 +2938,17 @@ class ProcessManager {
     const renderables = [];
     this.lineRenderables.set(pane.id, renderables);
     
+    // Determine copy mode selection range for this pane
+    const inCopyMode = this.isCopyMode && isFocused;
+    let copySelStart = -1;
+    let copySelEnd = -1;
+    if (inCopyMode) {
+      if (this.copyModeAnchor !== null) {
+        copySelStart = Math.min(this.copyModeAnchor, this.copyModeCursor);
+        copySelEnd = Math.max(this.copyModeAnchor, this.copyModeCursor);
+      }
+    }
+    
     // Add lines (oldest first, so newest is at bottom)
     for (let i = 0; i < linesToShow.length; i++) {
       const line = linesToShow[i];
@@ -2653,21 +2958,60 @@ class ProcessManager {
       const lineNumber = this.showLineNumbers ? String(line.lineNumber).padStart(4, ' ') : '';
       const timestamp = this.showTimestamps ? new Date(line.timestamp).toLocaleTimeString('en-US', { hour12: false }) : '';
       
+      // Determine copy mode highlighting for this line
+      const isCursorLine = inCopyMode && i === this.copyModeCursor;
+      const isSelectedLine = inCopyMode && i >= copySelStart && i <= copySelEnd;
+      
       let content;
-      if (this.showLineNumbers && this.showTimestamps) {
-        content = t`${fg(COLORS.textDim)(lineNumber)} ${fg(COLORS.textDim)(`[${timestamp}]`)} ${fg(processColor)(`[${line.process}]`)} ${line.text}`;
-      } else if (this.showLineNumbers) {
-        content = t`${fg(COLORS.textDim)(lineNumber)} ${fg(processColor)(`[${line.process}]`)} ${line.text}`;
-      } else if (this.showTimestamps) {
-        content = t`${fg(COLORS.textDim)(`[${timestamp}]`)} ${fg(processColor)(`[${line.process}]`)} ${line.text}`;
+      if (inCopyMode) {
+        // In copy mode: cursor line gets bright marker + white text on blue bg
+        // Selected lines get lighter text on darker blue bg
+        // Unselected lines are dimmed to make selection stand out
+        const marker = isCursorLine ? fg(COLORS.copyCursorText)('\u25b6 ') : '  ';
+        
+        let textColor, procColor, dimColor;
+        if (isCursorLine) {
+          textColor = COLORS.copyCursorText;
+          procColor = COLORS.copyCursorText;
+          dimColor = COLORS.copySelectText;
+        } else if (isSelectedLine) {
+          textColor = COLORS.copySelectText;
+          procColor = processColor;
+          dimColor = COLORS.textDim;
+        } else {
+          textColor = COLORS.textDim;
+          procColor = COLORS.textDim;
+          dimColor = COLORS.textDim;
+        }
+        
+        if (this.showLineNumbers && this.showTimestamps) {
+          content = t`${marker}${fg(dimColor)(lineNumber)} ${fg(dimColor)(`[${timestamp}]`)} ${fg(procColor)(`[${line.process}]`)} ${fg(textColor)(line.text)}`;
+        } else if (this.showLineNumbers) {
+          content = t`${marker}${fg(dimColor)(lineNumber)} ${fg(procColor)(`[${line.process}]`)} ${fg(textColor)(line.text)}`;
+        } else if (this.showTimestamps) {
+          content = t`${marker}${fg(dimColor)(`[${timestamp}]`)} ${fg(procColor)(`[${line.process}]`)} ${fg(textColor)(line.text)}`;
+        } else {
+          content = t`${marker}${fg(procColor)(`[${line.process}]`)} ${fg(textColor)(line.text)}`;
+        }
       } else {
-        content = t`${fg(processColor)(`[${line.process}]`)} ${line.text}`;
+        if (this.showLineNumbers && this.showTimestamps) {
+          content = t`${fg(COLORS.textDim)(lineNumber)} ${fg(COLORS.textDim)(`[${timestamp}]`)} ${fg(processColor)(`[${line.process}]`)} ${line.text}`;
+        } else if (this.showLineNumbers) {
+          content = t`${fg(COLORS.textDim)(lineNumber)} ${fg(processColor)(`[${line.process}]`)} ${line.text}`;
+        } else if (this.showTimestamps) {
+          content = t`${fg(COLORS.textDim)(`[${timestamp}]`)} ${fg(processColor)(`[${line.process}]`)} ${line.text}`;
+        } else {
+          content = t`${fg(processColor)(`[${line.process}]`)} ${line.text}`;
+        }
       }
+      
+      // High-contrast background: bright blue for cursor, medium blue for selected, black for rest
+      const bgColor = isCursorLine ? COLORS.copyCursorBg : (isSelectedLine ? COLORS.copySelectBg : '#000000');
       
       const outputLine = new TextRenderable(this.renderer, {
         id: `output-${pane.id}-${line.lineNumber}`,
         content: content,
-        bg: '#000000', // Black background for pane content
+        bg: bgColor,
       });
       
       container.add(outputLine);
@@ -2760,6 +3104,12 @@ class ProcessManager {
     this.paneScrollBoxes.set(pane.id, outputBox);
     
     this.buildPaneOutput(pane, outputBox.content, height);
+    
+    // Update paneLineCount so updateRunningUI() won't re-add these lines
+    const paneLines = this.getOutputLinesForPane(pane);
+    if (paneLines.length > 0) {
+      this.paneLineCount.set(pane.id, paneLines[paneLines.length - 1].lineNumber);
+    }
     
     // Restore or set scroll position immediately
     if (outputBox && outputBox.scrollTo) {
@@ -3181,9 +3531,9 @@ class ProcessManager {
       gap: 2,
     });
     
-    // Status (LIVE/PAUSED)
-    const statusText = this.isPaused ? 'PAUSED' : 'LIVE';
-    const statusColor = this.isPaused ? COLORS.warning : COLORS.success;
+    // Status (LIVE/PAUSED/COPY)
+    const statusText = this.isCopyMode ? 'COPY' : (this.isPaused ? 'PAUSED' : 'LIVE');
+    const statusColor = this.isCopyMode ? COLORS.accent : (this.isPaused ? COLORS.warning : COLORS.success);
     const statusIndicator = new TextRenderable(this.renderer, {
       id: 'status-indicator',
       content: t`${fg(statusColor)(statusText)}`,
@@ -3218,6 +3568,30 @@ class ProcessManager {
         content: t`${fg(COLORS.success)(inputText)}`,
       });
       leftSide.add(inputIndicator);
+    }
+    
+    // Copy mode indicator if active
+    if (this.isCopyMode) {
+      const selCount = this.copyModeAnchor !== null
+        ? Math.abs(this.copyModeCursor - this.copyModeAnchor) + 1
+        : 0;
+      const copyText = selCount > 0
+        ? `COPY [${selCount} line${selCount > 1 ? 's' : ''}] Space:clear y/Enter:copy`
+        : 'COPY  Space:start selection  y/Enter:copy line  Esc:exit';
+      const copyIndicator = new TextRenderable(this.renderer, {
+        id: 'copy-mode-indicator',
+        content: t`${fg(COLORS.accent)(copyText)}`,
+      });
+      leftSide.add(copyIndicator);
+    }
+    
+    // Copy feedback message (shown briefly after copying)
+    if (this.copyFeedbackMessage) {
+      const feedbackIndicator = new TextRenderable(this.renderer, {
+        id: 'copy-feedback',
+        content: t`${fg(COLORS.success)(this.copyFeedbackMessage)}`,
+      });
+      leftSide.add(feedbackIndicator);
     }
     
     // Color filter indicator if active on focused pane
@@ -3264,6 +3638,7 @@ class ProcessManager {
       { key: '1-9', desc: 'toggle', color: COLORS.success },
       { key: 'i', desc: 'input', color: COLORS.success },
       { key: 'n', desc: 'name', color: COLORS.accent },
+      { key: 'y', desc: 'copy', color: COLORS.accent },
       { key: 'p', desc: 'pause', color: COLORS.warning },
       { key: '/', desc: 'filter', color: COLORS.cyan },
       { key: 'c', desc: 'color', color: COLORS.magenta },
@@ -3321,6 +3696,7 @@ class ProcessManager {
     
     this.renderer.root.add(mainContainer);
     this.runningContainer = mainContainer;
+    this.uiJustRebuilt = true;  // Prevent redundant render in the same tick
   }
 }
 

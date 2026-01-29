@@ -46,6 +46,7 @@ Traditional solutions fall short:
 - **Persistent layouts**: Your pane configuration is saved between sessions
 - **Process-specific views**: Show/hide specific processes in each pane
 - **Colored output**: Each process gets unique color-coded output
+- **Copy mode**: Select and copy output lines to clipboard (`y`)
 - **Pause/resume**: Freeze output to review logs (`p`)
 - **Scrollable history**: 1000-line buffer with mouse wheel support
 - **Enhanced navigation**: Home/End/PageUp/PageDown keys
@@ -120,6 +121,15 @@ That's it! The TUI will:
 - `Tab` - Next pane
 - `Shift+Tab` - Previous pane
 - `n` - Name current pane
+
+*Copy Mode:*
+- `y` - Enter copy mode (select text to copy to clipboard)
+- `↑`/`↓` or `k`/`j` - Move cursor
+- `Home`/`End` or `g`/`G` - Jump to first/last line
+- `Page Up`/`Page Down` - Scroll by page
+- `Space` - Start/clear selection from cursor
+- `Enter` or `y` - Copy selected lines (or current line) to clipboard
+- `Esc` or `q` - Exit copy mode
 
 *Filtering & View:*
 - `/` - Enter text filter mode
