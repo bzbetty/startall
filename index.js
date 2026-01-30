@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { createCliRenderer, TextRenderable, BoxRenderable, ScrollBoxRenderable, t, fg } from '@opentui/core';
+import { createCliRenderer, TextRenderable, BoxRenderable, ScrollBoxRenderable, ASCIIFontRenderable, t, fg, bold, dim, RGBA } from '@opentui/core';
 import { spawn, execSync, spawnSync } from 'child_process';
 import { readFileSync, writeFileSync, writeSync, existsSync } from 'fs';
 import { join } from 'path';
@@ -1956,7 +1956,7 @@ class ProcessManager {
       width: '100%',
       height: '100%',
       backgroundColor: COLORS.bg,
-      padding: 1,
+      padding: 2,
     });
     
     // Header bar with title
@@ -1964,6 +1964,7 @@ class ProcessManager {
       id: 'header-bar',
       flexDirection: 'row',
       justifyContent: 'space-between',
+      alignItems: 'center',
       width: '100%',
       border: ['bottom'],
       borderStyle: 'single',
@@ -1974,13 +1975,13 @@ class ProcessManager {
     
     const titleText = new TextRenderable(this.renderer, {
       id: 'title',
-      content: t`${fg(COLORS.accent)('# Settings')}`,
+      content: t`${bold(fg(COLORS.accent)('Settings'))}`,
     });
     headerBar.add(titleText);
     
     const versionText = new TextRenderable(this.renderer, {
       id: 'version',
-      content: t`${fg(COLORS.textDim)(APP_VERSION)}`,
+      content: t`${fg(COLORS.textDim)('startall')} ${fg(COLORS.textDim)('·')} ${fg(COLORS.textDim)(APP_VERSION)}`,
     });
     headerBar.add(versionText);
     
@@ -2121,40 +2122,42 @@ class ProcessManager {
       id: 'footer-bar',
       flexDirection: 'row',
       width: '100%',
+      backgroundColor: COLORS.bgLight,
       border: ['top'],
       borderStyle: 'single',
       borderColor: COLORS.border,
-      paddingTop: 1,
+      paddingLeft: 2,
+      paddingRight: 2,
       marginTop: 1,
-      gap: 2,
+      gap: 3,
     });
     
     let shortcuts;
     if (this.isAddingPattern) {
       shortcuts = [
-        { key: 'enter', desc: 'save' },
-        { key: 'esc', desc: 'cancel' },
+        { key: 'enter', desc: 'save', color: COLORS.success },
+        { key: 'esc', desc: 'cancel', color: COLORS.error },
       ];
     } else if (this.isAssigningShortcut) {
       shortcuts = [
-        { key: 'any key', desc: 'assign' },
-        { key: 'esc', desc: 'cancel' },
+        { key: 'any key', desc: 'assign', color: COLORS.warning },
+        { key: 'esc', desc: 'cancel', color: COLORS.error },
       ];
     } else {
       shortcuts = [
-        { key: 'tab', desc: 'section' },
-        { key: 'space', desc: this.settingsSection === 'shortcuts' ? 'assign' : 'toggle' },
-        { key: 'i', desc: 'add ignore' },
-        { key: 'n', desc: 'add include' },
-        { key: 'd', desc: 'delete' },
-        { key: 'esc', desc: 'back' },
+        { key: 'tab', desc: 'section', color: COLORS.cyan },
+        { key: 'space', desc: this.settingsSection === 'shortcuts' ? 'assign' : 'toggle', color: COLORS.success },
+        { key: 'i', desc: 'add ignore', color: COLORS.error },
+        { key: 'n', desc: 'add include', color: COLORS.success },
+        { key: 'd', desc: 'delete', color: COLORS.error },
+        { key: 'esc', desc: 'back', color: COLORS.textDim },
       ];
     }
     
-    shortcuts.forEach(({ key, desc }) => {
+    shortcuts.forEach(({ key, desc, color }) => {
       const shortcut = new TextRenderable(this.renderer, {
         id: `shortcut-${key}`,
-        content: t`${fg(COLORS.textDim)(key)} ${fg(COLORS.text)(desc)}`,
+        content: t`${fg(color || COLORS.accent)(key)} ${fg(COLORS.textDim)(desc)}`,
       });
       footerBar.add(shortcut);
     });
@@ -2424,17 +2427,49 @@ class ProcessManager {
       backgroundColor: COLORS.bg,
     });
     
-    // Scripts panel - compact with background for focused item
+    // Content area (centered vertically, with padding)
+    const contentArea = new BoxRenderable(this.renderer, {
+      id: 'content-area',
+      flexDirection: 'column',
+      flexGrow: 1,
+      padding: 2,
+      paddingBottom: 0,
+      gap: 1,
+    });
+    
+    // ASCII art title banner
+    const asciiTitle = new ASCIIFontRenderable(this.renderer, {
+      id: 'ascii-title',
+      text: 'startall',
+      font: 'tiny',
+      color: RGBA.fromHex(COLORS.accent),
+    });
+    contentArea.add(asciiTitle);
+    
+    // Subtitle with version
+    const subtitle = new TextRenderable(this.renderer, {
+      id: 'subtitle',
+      content: t`${dim(fg(COLORS.textDim)(`${APP_VERSION}  Process Manager`))}`,
+    });
+    contentArea.add(subtitle);
+    
+    // Scripts panel in a bordered box
     const scriptsPanel = new BoxRenderable(this.renderer, {
       id: 'scripts-panel',
       flexDirection: 'column',
       flexGrow: 1,
-      paddingLeft: 1,
-      paddingTop: 1,
+      border: true,
+      borderStyle: 'rounded',
+      borderColor: COLORS.border,
+      title: ' Select Scripts ',
+      titleAlignment: 'left',
+      padding: 1,
+      marginTop: 1,
     });
     
     // Track Y positions for mouse clicks
-    let currentY = 1; // start of scripts
+    // ASCII title is ~3 lines, subtitle 1 line, margins/padding ~5 lines, border top 1 line
+    let currentY = 10; // approximate start of scripts inside bordered box
     this.scriptLinePositions = [];
     
     this.scriptLines = this.scripts.map((script, index) => {
@@ -2450,17 +2485,21 @@ class ProcessManager {
       const numberLabel = index < 9 ? ` ${index + 1}` : '  ';
       
       // Build checkbox with colored brackets and checkmark
+      const checkIcon = isSelected ? '✓' : ' ';
+      const pointer = isFocused ? fg(COLORS.accent)('❯ ') : '  ';
+      
       let content;
       if (isSelected) {
-        content = t`${fg(numberColor)(numberLabel)} ${fg(bracketColor)('[')}${fg(COLORS.text)('✓')}${fg(bracketColor)(']')} ${fg(nameColor)(script.displayName)}`;
+        content = t`${pointer}${fg(numberColor)(numberLabel)} ${fg(bracketColor)('[')}${fg(COLORS.success)(checkIcon)}${fg(bracketColor)(']')} ${fg(nameColor)(script.displayName)}`;
       } else {
-        content = t`${fg(numberColor)(numberLabel)} ${fg(bracketColor)('[ ]')} ${fg(nameColor)(script.displayName)}`;
+        content = t`${pointer}${fg(numberColor)(numberLabel)} ${fg(bracketColor)('[ ]')} ${fg(nameColor)(script.displayName)}`;
       }
       
       const lineContainer = new BoxRenderable(this.renderer, {
         id: `script-box-${index}`,
         backgroundColor: bgColor,
         paddingLeft: 1,
+        paddingRight: 1,
         width: '100%',
       });
       
@@ -2475,7 +2514,8 @@ class ProcessManager {
       return lineContainer;
     });
     
-    this.selectionContainer.add(scriptsPanel);
+    contentArea.add(scriptsPanel);
+    this.selectionContainer.add(contentArea);
     
     // Footer bar with title, countdown, and shortcuts
     const footerBar = new BoxRenderable(this.renderer, {
@@ -2484,11 +2524,14 @@ class ProcessManager {
       justifyContent: 'space-between',
       width: '100%',
       backgroundColor: COLORS.bgLight,
-      paddingLeft: 1,
-      paddingRight: 1,
+      paddingLeft: 2,
+      paddingRight: 2,
+      border: ['top'],
+      borderStyle: 'single',
+      borderColor: COLORS.border,
     });
     
-    // Left side: title and countdown
+    // Left side: countdown timer
     const leftSide = new BoxRenderable(this.renderer, {
       id: 'footer-left',
       flexDirection: 'row',
@@ -2497,7 +2540,7 @@ class ProcessManager {
     
     const titleText = new TextRenderable(this.renderer, {
       id: 'title',
-      content: t`${fg(COLORS.accent)('startall')} ${fg(COLORS.warning)(this.countdown + 's')}`,
+      content: t`${fg(COLORS.accent)('startall')} ${fg(COLORS.textDim)('·')} ${fg(COLORS.warning)(`${this.countdown}s`)}`,
     });
     leftSide.add(titleText);
     this.headerText = titleText; // Save reference for countdown updates
@@ -2513,23 +2556,23 @@ class ProcessManager {
     
     footerBar.add(leftSide);
     
-    // Right side: shortcuts
+    // Right side: shortcuts with visual badges
     const rightSide = new BoxRenderable(this.renderer, {
       id: 'footer-right',
       flexDirection: 'row',
-      gap: 2,
+      gap: 3,
     });
     
     const shortcuts = [
-      { key: 'spc', desc: 'sel', color: COLORS.success },
-      { key: 'ret', desc: 'go', color: COLORS.accent },
-      { key: 'o', desc: 'cfg', color: COLORS.magenta },
+      { key: 'space', desc: 'select', color: COLORS.success },
+      { key: 'enter', desc: 'start', color: COLORS.accent },
+      { key: 'o', desc: 'settings', color: COLORS.magenta },
     ];
     
     shortcuts.forEach(({ key, desc, color }) => {
       const shortcut = new TextRenderable(this.renderer, {
         id: `shortcut-${key}`,
-        content: t`${fg(color)(key)}${fg(COLORS.textDim)(':' + desc)}`,
+        content: t`${fg(color)(key)} ${fg(COLORS.textDim)(desc)}`,
       });
       rightSide.add(shortcut);
     });
@@ -3207,11 +3250,20 @@ class ProcessManager {
     });
     
     // Footer hint
+    const hintBar = new BoxRenderable(this.renderer, {
+      id: 'menu-hint-bar',
+      border: ['top'],
+      borderStyle: 'single',
+      borderColor: COLORS.border,
+      paddingTop: 1,
+      marginTop: 1,
+    });
     const hint = new TextRenderable(this.renderer, {
       id: 'menu-hint',
-      content: t`${fg(COLORS.textDim)('Enter to select, Esc to close')}`,
+      content: t`${fg(COLORS.accent)('enter')} ${fg(COLORS.textDim)('select')}  ${fg(COLORS.accent)('esc')} ${fg(COLORS.textDim)('close')}`,
     });
-    overlay.add(hint);
+    hintBar.add(hint);
+    overlay.add(hintBar);
     
     parent.add(overlay);
   }
@@ -3455,7 +3507,12 @@ class ProcessManager {
       flexDirection: 'row',
       width: '100%',
       backgroundColor: COLORS.bgLight,
-      paddingLeft: 1,
+      paddingLeft: 2,
+      paddingRight: 2,
+      gap: 1,
+      border: ['bottom'],
+      borderStyle: 'single',
+      borderColor: COLORS.border,
     });
     this.processBarContainer = processBar;  // Save reference for light updates
     
@@ -3513,15 +3570,18 @@ class ProcessManager {
     
     mainContainer.add(paneArea);
     
-    // Footer bar - compact style matching selection UI
+    // Footer bar - polished with top border
     const footerBar = new BoxRenderable(this.renderer, {
       id: 'footer-bar',
       flexDirection: 'row',
       width: '100%',
       backgroundColor: COLORS.bgLight,
-      paddingLeft: 1,
-      paddingRight: 1,
+      paddingLeft: 2,
+      paddingRight: 2,
       justifyContent: 'space-between',
+      border: ['top'],
+      borderStyle: 'single',
+      borderColor: COLORS.border,
     });
     
     // Left side: status indicator and filter
@@ -3632,47 +3692,80 @@ class ProcessManager {
       gap: 2,
     });
     
-    const shortcuts = [
-      { key: '\\', desc: 'panes', color: COLORS.cyan },
-      { key: 'e', desc: 'execute', color: COLORS.warning },
-      { key: '1-9', desc: 'toggle', color: COLORS.success },
-      { key: 'i', desc: 'input', color: COLORS.success },
-      { key: 'n', desc: 'name', color: COLORS.accent },
-      { key: 'y', desc: 'copy', color: COLORS.accent },
-      { key: 'p', desc: 'pause', color: COLORS.warning },
-      { key: '/', desc: 'filter', color: COLORS.cyan },
-      { key: 'c', desc: 'color', color: COLORS.magenta },
-      { key: 's', desc: 'stop', color: COLORS.error },
-      { key: 'r', desc: 'restart', color: COLORS.success },
-      { key: 'o', desc: 'settings', color: COLORS.magenta },
-      { key: 'q', desc: 'quit', color: COLORS.error },
+    // Shortcut groups separated by dimmed pipe characters
+    const shortcutGroups = [
+      // Pane & navigation
+      [
+        { key: '\\', desc: 'panes', color: COLORS.cyan },
+        { key: '1-9', desc: 'toggle', color: COLORS.success },
+      ],
+      // Process control
+      [
+        { key: 's', desc: 'stop', color: COLORS.error },
+        { key: 'r', desc: 'restart', color: COLORS.success },
+        { key: 'e', desc: 'execute', color: COLORS.warning },
+      ],
+      // View & edit
+      [
+        { key: 'p', desc: 'pause', color: COLORS.warning },
+        { key: '/', desc: 'filter', color: COLORS.cyan },
+        { key: 'c', desc: 'color', color: COLORS.magenta },
+        { key: 'y', desc: 'copy', color: COLORS.accent },
+      ],
+      // Misc
+      [
+        { key: 'i', desc: 'input', color: COLORS.success },
+        { key: 'n', desc: 'name', color: COLORS.accent },
+        { key: 'o', desc: 'cfg', color: COLORS.magenta },
+        { key: 'q', desc: 'quit', color: COLORS.error },
+      ],
     ];
     
-    // Add configured quick command shortcuts
+    // Add configured quick command shortcuts to the first group
     const configShortcuts = this.config.shortcuts || {};
+    const customGroup = [];
     for (const [key, scriptName] of Object.entries(configShortcuts)) {
-      // Show first 3 shortcuts to avoid cluttering footer
-      if (Object.keys(configShortcuts).length <= 3 || shortcuts.length < 15) {
+      if (customGroup.length < 3) {
         const script = this.allScripts.find(s => s.name === scriptName);
         if (script) {
           const shortDesc = script.displayName.length > 8 ? script.displayName.substring(0, 6) + '..' : script.displayName;
-          shortcuts.splice(2, 0, { key, desc: shortDesc, color: this.processColors.get(script.name) || COLORS.text });
+          customGroup.push({ key, desc: shortDesc, color: this.processColors.get(script.name) || COLORS.text });
         }
       }
     }
+    if (customGroup.length > 0) {
+      shortcutGroups.splice(1, 0, customGroup);
+    }
     
-    shortcuts.forEach(({ key, desc, color }) => {
-      const shortcut = new TextRenderable(this.renderer, {
-        id: `shortcut-${key}`,
-        content: t`${fg(color)(key)}${fg(COLORS.textDim)(':' + desc)}`,
+    shortcutGroups.forEach((group, groupIdx) => {
+      // Add separator between groups
+      if (groupIdx > 0) {
+        const sep = new TextRenderable(this.renderer, {
+          id: `shortcut-sep-${groupIdx}`,
+          content: t`${fg(COLORS.border)('│')}`,
+        });
+        rightSide.add(sep);
+      }
+      
+      group.forEach(({ key, desc, color }) => {
+        const shortcut = new TextRenderable(this.renderer, {
+          id: `shortcut-${key}`,
+          content: t`${fg(color)(key)} ${fg(COLORS.textDim)(desc)}`,
+        });
+        rightSide.add(shortcut);
       });
-      rightSide.add(shortcut);
     });
     
-    // Title and version on far right
+    // Title and version on far right, separated
+    const titleSep = new TextRenderable(this.renderer, {
+      id: 'footer-title-sep',
+      content: t`${fg(COLORS.border)('│')}`,
+    });
+    rightSide.add(titleSep);
+    
     const titleText = new TextRenderable(this.renderer, {
       id: 'footer-title',
-      content: t`${fg(COLORS.accent)('running')} ${fg(COLORS.textDim)(APP_VERSION)}`,
+      content: t`${fg(COLORS.accent)('startall')} ${fg(COLORS.textDim)(APP_VERSION)}`,
     });
     rightSide.add(titleText);
     
