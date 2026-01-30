@@ -331,6 +331,107 @@ function copyToClipboard(text) {
   return copied;
 }
 
+// Git utility functions
+function isGitRepo() {
+  try {
+    execSync('git rev-parse --is-inside-work-tree', { stdio: 'pipe', windowsHide: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function getGitBranch() {
+  try {
+    return execSync('git branch --show-current', { stdio: 'pipe', windowsHide: true }).toString().trim();
+  } catch {
+    return '';
+  }
+}
+
+function getGitStatus() {
+  try {
+    const output = execSync('git status --porcelain', { stdio: 'pipe', windowsHide: true }).toString().trim();
+    const staged = [];
+    const modified = [];
+    const untracked = [];
+
+    if (!output) return { staged, modified, untracked, clean: true };
+
+    output.split('\n').forEach(line => {
+      if (!line) return;
+      const indexStatus = line[0];
+      const workTreeStatus = line[1];
+      const filePath = line.substring(3);
+
+      // Staged changes (index has a non-space, non-? status)
+      if (indexStatus !== ' ' && indexStatus !== '?') {
+        staged.push({ status: indexStatus, file: filePath });
+      }
+      // Unstaged modifications
+      if (workTreeStatus === 'M' || workTreeStatus === 'D') {
+        modified.push({ status: workTreeStatus, file: filePath });
+      }
+      // Untracked files
+      if (indexStatus === '?' && workTreeStatus === '?') {
+        untracked.push({ file: filePath });
+      }
+    });
+
+    return { staged, modified, untracked, clean: false };
+  } catch {
+    return { staged: [], modified: [], untracked: [], clean: true, error: true };
+  }
+}
+
+function getGitRemoteStatus() {
+  try {
+    // Fetch to get latest remote state (silently)
+    const localRef = execSync('git rev-parse HEAD', { stdio: 'pipe', windowsHide: true }).toString().trim();
+    let remoteRef = '';
+    try {
+      remoteRef = execSync('git rev-parse @{u}', { stdio: 'pipe', windowsHide: true }).toString().trim();
+    } catch {
+      return { ahead: 0, behind: 0, hasRemote: false };
+    }
+    const ahead = parseInt(execSync(`git rev-list --count ${remoteRef}..${localRef}`, { stdio: 'pipe', windowsHide: true }).toString().trim()) || 0;
+    const behind = parseInt(execSync(`git rev-list --count ${localRef}..${remoteRef}`, { stdio: 'pipe', windowsHide: true }).toString().trim()) || 0;
+    return { ahead, behind, hasRemote: true };
+  } catch {
+    return { ahead: 0, behind: 0, hasRemote: false };
+  }
+}
+
+function gitStageAll() {
+  try {
+    execSync('git add -A', { stdio: 'pipe', windowsHide: true });
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err.stderr?.toString() || err.message };
+  }
+}
+
+function gitCommit(message) {
+  try {
+    const output = execSync(`git commit -m "${message.replace(/"/g, '\\"')}"`, { stdio: 'pipe', windowsHide: true }).toString().trim();
+    return { success: true, output };
+  } catch (err) {
+    return { success: false, error: err.stderr?.toString() || err.stdout?.toString() || err.message };
+  }
+}
+
+function gitPush() {
+  try {
+    const output = execSync('git push', { stdio: 'pipe', windowsHide: true, timeout: 30000 }).toString().trim();
+    return { success: true, output: output || 'Pushed successfully' };
+  } catch (err) {
+    return { success: false, error: err.stderr?.toString() || err.message };
+  }
+}
+
+// Detect git repo once at startup
+const IS_GIT_REPO = isGitRepo();
+
 // Color palette (inspired by Tokyo Night theme)
 const COLORS = {
   border: '#3b4261',
@@ -513,6 +614,17 @@ class ProcessManager {
     this.copyFeedbackMessage = '';  // Temporary feedback message after copying
     this.copyFeedbackTimer = null;  // Timer to clear feedback message
     
+    // Git modal state
+    this.showGitModal = false;       // Whether the git modal is visible
+    this.gitModalPhase = 'status';   // 'status' | 'commit' | 'committing' | 'pushing' | 'result'
+    this.gitBranch = '';             // Current git branch name
+    this.gitStatus = null;           // Git status object { staged, modified, untracked, clean }
+    this.gitRemoteStatus = null;     // Remote status { ahead, behind, hasRemote }
+    this.gitCommitMessage = '';      // Commit message being typed
+    this.gitModalOutput = [];        // Output/status messages for the modal
+    this.gitModalSelectedIndex = 0;  // Selected file index in the status list
+    this.gitStageSelection = 'all';  // 'all' for stage all (future: individual file staging)
+    
     // Assign colors to each script
     this.processColors = new Map();
     const colors = ['#7aa2f7', '#bb9af7', '#9ece6a', '#f7768e', '#e0af68', '#73daca'];
@@ -613,6 +725,12 @@ class ProcessManager {
           this.closeCommandOverlay();
           this.buildRunningUI();
         }
+        return;
+      }
+      
+      // Handle git modal
+      if (this.showGitModal) {
+        this.handleGitModalInput(keyName, keyEvent);
         return;
       }
       
@@ -857,6 +975,9 @@ class ProcessManager {
         } else if (keyName === 'y') {
           // Enter copy mode (select text to copy)
           this.enterCopyMode();
+        } else if (keyName === 'g' && IS_GIT_REPO) {
+          // Open git modal (commit & push)
+          this.openGitModal();
         } else if (keyName && keyName.length === 1 && !keyEvent.ctrl && !keyEvent.meta && !keyEvent.shift) {
           // Check if this key is a custom shortcut
           const shortcuts = this.config.shortcuts || {};
@@ -2396,6 +2517,157 @@ class ProcessManager {
     this.commandOverlayStatus = 'running';
     this.commandOverlayProcess = null;
   }
+  
+  // Open the git modal and refresh status
+  openGitModal() {
+    this.showGitModal = true;
+    this.gitModalPhase = 'status';
+    this.gitCommitMessage = '';
+    this.gitModalOutput = [];
+    this.gitModalSelectedIndex = 0;
+    this.refreshGitStatus();
+    this.buildRunningUI();
+  }
+  
+  // Close the git modal
+  closeGitModal() {
+    this.showGitModal = false;
+    this.gitModalPhase = 'status';
+    this.gitCommitMessage = '';
+    this.gitModalOutput = [];
+  }
+  
+  // Refresh git status data
+  refreshGitStatus() {
+    this.gitBranch = getGitBranch();
+    this.gitStatus = getGitStatus();
+    this.gitRemoteStatus = getGitRemoteStatus();
+  }
+  
+  // Handle keyboard input for the git modal
+  handleGitModalInput(keyName, keyEvent) {
+    if (this.gitModalPhase === 'status') {
+      if (keyName === 'escape' || keyName === 'q') {
+        this.closeGitModal();
+        this.buildRunningUI();
+      } else if (keyName === 'c') {
+        // Start commit flow - switch to commit message input
+        this.gitModalPhase = 'commit';
+        this.gitCommitMessage = '';
+        this.buildRunningUI();
+      } else if (keyName === 'a') {
+        // Stage all changes
+        const result = gitStageAll();
+        if (result.success) {
+          this.gitModalOutput = ['All changes staged.'];
+        } else {
+          this.gitModalOutput = [`Error staging: ${result.error}`];
+        }
+        this.refreshGitStatus();
+        this.buildRunningUI();
+      } else if (keyName === 'p') {
+        // Push
+        this.gitModalPhase = 'pushing';
+        this.gitModalOutput = ['Pushing...'];
+        this.buildRunningUI();
+        // Push asynchronously using setTimeout to allow UI update
+        setTimeout(() => {
+          const result = gitPush();
+          if (result.success) {
+            this.gitModalOutput = [result.output];
+          } else {
+            this.gitModalOutput = [`Push failed: ${result.error}`];
+          }
+          this.gitModalPhase = 'result';
+          this.refreshGitStatus();
+          this.buildRunningUI();
+        }, 10);
+      } else if (keyName === 'r') {
+        // Refresh status
+        this.refreshGitStatus();
+        this.gitModalOutput = ['Status refreshed.'];
+        this.buildRunningUI();
+      } else if (keyName === 'up' || keyName === 'k') {
+        this.gitModalSelectedIndex = Math.max(0, this.gitModalSelectedIndex - 1);
+        this.buildRunningUI();
+      } else if (keyName === 'down' || keyName === 'j') {
+        const totalFiles = (this.gitStatus?.staged?.length || 0) + (this.gitStatus?.modified?.length || 0) + (this.gitStatus?.untracked?.length || 0);
+        this.gitModalSelectedIndex = Math.min(Math.max(0, totalFiles - 1), this.gitModalSelectedIndex + 1);
+        this.buildRunningUI();
+      }
+    } else if (this.gitModalPhase === 'commit') {
+      if (keyName === 'escape') {
+        this.gitModalPhase = 'status';
+        this.gitCommitMessage = '';
+        this.buildRunningUI();
+      } else if (keyName === 'enter' || keyName === 'return') {
+        if (this.gitCommitMessage.trim()) {
+          // Stage all and commit
+          this.gitModalPhase = 'committing';
+          this.gitModalOutput = ['Staging and committing...'];
+          this.buildRunningUI();
+          setTimeout(() => {
+            // Stage all first
+            const stageResult = gitStageAll();
+            if (!stageResult.success) {
+              this.gitModalOutput = [`Error staging: ${stageResult.error}`];
+              this.gitModalPhase = 'result';
+              this.buildRunningUI();
+              return;
+            }
+            // Then commit
+            const commitResult = gitCommit(this.gitCommitMessage.trim());
+            if (commitResult.success) {
+              this.gitModalOutput = [commitResult.output, '', 'Commit successful! Press p to push, esc to close.'];
+              this.gitModalPhase = 'status';
+            } else {
+              this.gitModalOutput = [`Commit failed: ${commitResult.error}`];
+              this.gitModalPhase = 'result';
+            }
+            this.gitCommitMessage = '';
+            this.refreshGitStatus();
+            this.buildRunningUI();
+          }, 10);
+        }
+      } else if (keyName === 'backspace') {
+        this.gitCommitMessage = this.gitCommitMessage.slice(0, -1);
+        this.buildRunningUI();
+      } else if (keyName === 'space') {
+        this.gitCommitMessage += ' ';
+        this.buildRunningUI();
+      } else if (keyName && keyName.length === 1 && !keyEvent.ctrl && !keyEvent.meta) {
+        this.gitCommitMessage += keyName;
+        this.buildRunningUI();
+      }
+    } else if (this.gitModalPhase === 'result') {
+      // Any key returns to status or closes
+      if (keyName === 'escape' || keyName === 'q') {
+        this.closeGitModal();
+        this.buildRunningUI();
+      } else if (keyName === 'p') {
+        // Allow pushing from result phase
+        this.gitModalPhase = 'pushing';
+        this.gitModalOutput = ['Pushing...'];
+        this.buildRunningUI();
+        setTimeout(() => {
+          const result = gitPush();
+          if (result.success) {
+            this.gitModalOutput = [result.output];
+          } else {
+            this.gitModalOutput = [`Push failed: ${result.error}`];
+          }
+          this.gitModalPhase = 'result';
+          this.refreshGitStatus();
+          this.buildRunningUI();
+        }, 10);
+      } else {
+        this.gitModalPhase = 'status';
+        this.refreshGitStatus();
+        this.buildRunningUI();
+      }
+    }
+    // 'committing' and 'pushing' phases ignore input (busy)
+  }
 
   buildSelectionUI() {
     // Remove old containers if they exist - use destroyRecursively to clean up all children
@@ -2544,6 +2816,18 @@ class ProcessManager {
     });
     leftSide.add(titleText);
     this.headerText = titleText; // Save reference for countdown updates
+    
+    // Git branch indicator
+    if (IS_GIT_REPO) {
+      const branch = getGitBranch();
+      if (branch) {
+        const branchIndicator = new TextRenderable(this.renderer, {
+          id: 'git-branch-indicator',
+          content: t`${fg(COLORS.magenta)('\u2387')} ${fg(COLORS.magenta)(branch)}`,
+        });
+        leftSide.add(branchIndicator);
+      }
+    }
     
     // VS Code hint
     if (IS_VSCODE) {
@@ -3458,6 +3742,288 @@ class ProcessManager {
     parent.add(overlay);
   }
   
+  // Build git commit & push modal overlay
+  buildGitModal(parent) {
+    const branch = this.gitBranch || 'unknown';
+    const status = this.gitStatus || { staged: [], modified: [], untracked: [], clean: true };
+    const remote = this.gitRemoteStatus || { ahead: 0, behind: 0, hasRemote: false };
+    
+    // Title with branch name and status
+    let titleIcon = '';
+    if (this.gitModalPhase === 'committing') titleIcon = '...';
+    else if (this.gitModalPhase === 'pushing') titleIcon = '...';
+    else titleIcon = '';
+    const title = ` Git: ${branch} ${titleIcon}`;
+    
+    // Create centered overlay
+    const overlay = new BoxRenderable(this.renderer, {
+      id: 'git-modal',
+      position: 'absolute',
+      top: '10%',
+      left: '15%',
+      width: '70%',
+      height: '80%',
+      backgroundColor: COLORS.bg,
+      border: true,
+      borderStyle: 'rounded',
+      borderColor: COLORS.accent,
+      title: title,
+      padding: 1,
+      flexDirection: 'column',
+    });
+    
+    // Remote status line
+    if (remote.hasRemote) {
+      let remoteText = '';
+      if (remote.ahead > 0 && remote.behind > 0) {
+        remoteText = `${remote.ahead} ahead, ${remote.behind} behind remote`;
+      } else if (remote.ahead > 0) {
+        remoteText = `${remote.ahead} commit${remote.ahead > 1 ? 's' : ''} ahead of remote`;
+      } else if (remote.behind > 0) {
+        remoteText = `${remote.behind} commit${remote.behind > 1 ? 's' : ''} behind remote`;
+      } else {
+        remoteText = 'Up to date with remote';
+      }
+      const remoteColor = (remote.ahead > 0 || remote.behind > 0) ? COLORS.warning : COLORS.success;
+      const remoteLine = new TextRenderable(this.renderer, {
+        id: 'git-remote-status',
+        content: t`${fg(remoteColor)(remoteText)}`,
+      });
+      overlay.add(remoteLine);
+    } else {
+      const noRemote = new TextRenderable(this.renderer, {
+        id: 'git-no-remote',
+        content: t`${fg(COLORS.textDim)('No remote tracking branch')}`,
+      });
+      overlay.add(noRemote);
+    }
+    
+    // Separator
+    const sep1 = new BoxRenderable(this.renderer, {
+      id: 'git-sep1',
+      border: ['bottom'],
+      borderStyle: 'single',
+      borderColor: COLORS.border,
+      marginTop: 1,
+      marginBottom: 1,
+      width: '100%',
+    });
+    overlay.add(sep1);
+    
+    // Commit message input area (shown when in commit phase)
+    if (this.gitModalPhase === 'commit') {
+      const commitLabel = new TextRenderable(this.renderer, {
+        id: 'git-commit-label',
+        content: t`${fg(COLORS.accent)('Commit message:')}`,
+      });
+      overlay.add(commitLabel);
+      
+      const commitInput = new BoxRenderable(this.renderer, {
+        id: 'git-commit-input-box',
+        border: true,
+        borderStyle: 'single',
+        borderColor: COLORS.accent,
+        padding: 1,
+        marginTop: 1,
+        marginBottom: 1,
+        width: '100%',
+      });
+      
+      const commitText = new TextRenderable(this.renderer, {
+        id: 'git-commit-text',
+        content: t`${fg(COLORS.text)(this.gitCommitMessage)}${fg(COLORS.accent)('_')}`,
+      });
+      commitInput.add(commitText);
+      overlay.add(commitInput);
+      
+      const commitHint = new TextRenderable(this.renderer, {
+        id: 'git-commit-hint',
+        content: t`${fg(COLORS.textDim)('All changes will be staged and committed.')}`,
+      });
+      overlay.add(commitHint);
+    } else if (this.gitModalPhase === 'committing' || this.gitModalPhase === 'pushing') {
+      // Show busy indicator
+      const busyText = this.gitModalPhase === 'committing' ? 'Committing...' : 'Pushing...';
+      const busyLine = new TextRenderable(this.renderer, {
+        id: 'git-busy',
+        content: t`${fg(COLORS.warning)(busyText)}`,
+      });
+      overlay.add(busyLine);
+    } else {
+      // Status view or result view - show file lists
+      
+      // Show output messages if any
+      if (this.gitModalOutput.length > 0) {
+        this.gitModalOutput.forEach((line, idx) => {
+          const outputLine = new TextRenderable(this.renderer, {
+            id: `git-output-${idx}`,
+            content: t`${fg(COLORS.success)(line)}`,
+          });
+          overlay.add(outputLine);
+        });
+        
+        const outputSep = new BoxRenderable(this.renderer, {
+          id: 'git-output-sep',
+          border: ['bottom'],
+          borderStyle: 'single',
+          borderColor: COLORS.border,
+          marginTop: 1,
+          marginBottom: 1,
+          width: '100%',
+        });
+        overlay.add(outputSep);
+      }
+      
+      if (status.clean) {
+        const cleanText = new TextRenderable(this.renderer, {
+          id: 'git-clean',
+          content: t`${fg(COLORS.success)('Working tree clean - nothing to commit.')}`,
+        });
+        overlay.add(cleanText);
+      } else {
+        // Scrollable file list
+        const fileListHeight = Math.floor(this.renderer.height * 0.8) - 14;
+        const fileList = new ScrollBoxRenderable(this.renderer, {
+          id: 'git-file-list',
+          height: Math.max(5, fileListHeight),
+          scrollX: false,
+          scrollY: true,
+          focusable: true,
+          style: {
+            rootOptions: {
+              flexGrow: 1,
+              backgroundColor: COLORS.bg,
+            },
+            contentOptions: {
+              backgroundColor: COLORS.bg,
+              width: '100%',
+            },
+          },
+        });
+        
+        let fileIndex = 0;
+        
+        // Staged files
+        if (status.staged.length > 0) {
+          const stagedHeader = new TextRenderable(this.renderer, {
+            id: 'git-staged-header',
+            content: t`${fg(COLORS.success)(bold('Staged Changes'))} ${fg(COLORS.textDim)(`(${status.staged.length})`)}`,
+          });
+          fileList.content.add(stagedHeader);
+          
+          status.staged.forEach((file, idx) => {
+            const isFocused = fileIndex === this.gitModalSelectedIndex;
+            const indicator = isFocused ? '>' : ' ';
+            const statusLabel = file.status === 'A' ? 'new' : file.status === 'M' ? 'mod' : file.status === 'D' ? 'del' : file.status === 'R' ? 'ren' : file.status;
+            
+            const fileLine = new TextRenderable(this.renderer, {
+              id: `git-staged-${idx}`,
+              content: t`${fg(isFocused ? COLORS.accent : COLORS.textDim)(indicator)} ${fg(COLORS.success)(statusLabel)} ${fg(COLORS.text)(file.file)}`,
+            });
+            fileList.content.add(fileLine);
+            fileIndex++;
+          });
+        }
+        
+        // Modified (unstaged) files
+        if (status.modified.length > 0) {
+          const modHeader = new TextRenderable(this.renderer, {
+            id: 'git-modified-header',
+            content: t`${fg(COLORS.warning)(bold('Unstaged Changes'))} ${fg(COLORS.textDim)(`(${status.modified.length})`)}`,
+          });
+          fileList.content.add(modHeader);
+          
+          status.modified.forEach((file, idx) => {
+            const isFocused = fileIndex === this.gitModalSelectedIndex;
+            const indicator = isFocused ? '>' : ' ';
+            const statusLabel = file.status === 'M' ? 'mod' : file.status === 'D' ? 'del' : file.status;
+            
+            const fileLine = new TextRenderable(this.renderer, {
+              id: `git-modified-${idx}`,
+              content: t`${fg(isFocused ? COLORS.accent : COLORS.textDim)(indicator)} ${fg(COLORS.warning)(statusLabel)} ${fg(COLORS.text)(file.file)}`,
+            });
+            fileList.content.add(fileLine);
+            fileIndex++;
+          });
+        }
+        
+        // Untracked files
+        if (status.untracked.length > 0) {
+          const untrackedHeader = new TextRenderable(this.renderer, {
+            id: 'git-untracked-header',
+            content: t`${fg(COLORS.error)(bold('Untracked Files'))} ${fg(COLORS.textDim)(`(${status.untracked.length})`)}`,
+          });
+          fileList.content.add(untrackedHeader);
+          
+          status.untracked.forEach((file, idx) => {
+            const isFocused = fileIndex === this.gitModalSelectedIndex;
+            const indicator = isFocused ? '>' : ' ';
+            
+            const fileLine = new TextRenderable(this.renderer, {
+              id: `git-untracked-${idx}`,
+              content: t`${fg(isFocused ? COLORS.accent : COLORS.textDim)(indicator)} ${fg(COLORS.error)('new')} ${fg(COLORS.textDim)(file.file)}`,
+            });
+            fileList.content.add(fileLine);
+            fileIndex++;
+          });
+        }
+        
+        overlay.add(fileList);
+      }
+    }
+    
+    // Footer hint bar
+    const hintBar = new BoxRenderable(this.renderer, {
+      id: 'git-hint-bar',
+      border: ['top'],
+      borderStyle: 'single',
+      borderColor: COLORS.border,
+      paddingTop: 1,
+      paddingLeft: 1,
+      marginTop: 1,
+      flexDirection: 'row',
+      gap: 2,
+    });
+    
+    if (this.gitModalPhase === 'commit') {
+      const hints = [
+        { key: 'enter', desc: 'commit', color: COLORS.success },
+        { key: 'esc', desc: 'cancel', color: COLORS.error },
+      ];
+      hints.forEach(({ key, desc, color }) => {
+        const hint = new TextRenderable(this.renderer, {
+          id: `git-hint-${key}`,
+          content: t`${fg(color)(key)} ${fg(COLORS.textDim)(desc)}`,
+        });
+        hintBar.add(hint);
+      });
+    } else if (this.gitModalPhase === 'committing' || this.gitModalPhase === 'pushing') {
+      const hint = new TextRenderable(this.renderer, {
+        id: 'git-hint-busy',
+        content: t`${fg(COLORS.warning)('Please wait...')}`,
+      });
+      hintBar.add(hint);
+    } else {
+      const hints = [
+        { key: 'c', desc: 'commit', color: COLORS.success },
+        { key: 'a', desc: 'stage all', color: COLORS.warning },
+        { key: 'p', desc: 'push', color: COLORS.cyan },
+        { key: 'r', desc: 'refresh', color: COLORS.magenta },
+        { key: 'esc', desc: 'close', color: COLORS.error },
+      ];
+      hints.forEach(({ key, desc, color }) => {
+        const hint = new TextRenderable(this.renderer, {
+          id: `git-hint-${key}`,
+          content: t`${fg(color)(key)} ${fg(COLORS.textDim)(desc)}`,
+        });
+        hintBar.add(hint);
+      });
+    }
+    
+    overlay.add(hintBar);
+    parent.add(overlay);
+  }
+  
   buildRunningUI() {
     // Save scroll positions before destroying
     for (const [paneId, scrollBox] of this.paneScrollBoxes.entries()) {
@@ -3600,6 +4166,19 @@ class ProcessManager {
     });
     leftSide.add(statusIndicator);
     
+    // Git branch indicator
+    if (IS_GIT_REPO) {
+      const branch = this.gitBranch || getGitBranch();
+      if (branch) {
+        this.gitBranch = branch;
+        const branchIndicator = new TextRenderable(this.renderer, {
+          id: 'git-branch-indicator',
+          content: t`${fg(COLORS.magenta)('\u2387')} ${fg(COLORS.magenta)(branch)}`,
+        });
+        leftSide.add(branchIndicator);
+      }
+    }
+    
     // VS Code hint
     if (IS_VSCODE) {
       const vscodeHint = new TextRenderable(this.renderer, {
@@ -3716,6 +4295,7 @@ class ProcessManager {
       [
         { key: 'i', desc: 'input', color: COLORS.success },
         { key: 'n', desc: 'name', color: COLORS.accent },
+        ...(IS_GIT_REPO ? [{ key: 'g', desc: 'git', color: COLORS.magenta }] : []),
         { key: 'o', desc: 'cfg', color: COLORS.magenta },
         { key: 'q', desc: 'quit', color: COLORS.error },
       ],
@@ -3785,6 +4365,11 @@ class ProcessManager {
     // Add command output overlay if active
     if (this.showCommandOverlay) {
       this.buildCommandOverlay(mainContainer);
+    }
+    
+    // Add git modal if active
+    if (this.showGitModal) {
+      this.buildGitModal(mainContainer);
     }
     
     this.renderer.root.add(mainContainer);

@@ -68,6 +68,11 @@ Traditional solutions fall short:
 - **Settings panel**: Configure ignore/include patterns, shortcuts, and more (`o`)
   - Wildcard support (`*`) for pattern matching
   - Per-script visibility toggles
+- **Git integration**: Commit and push directly from the TUI (`g`)
+  - Auto-detects git repositories
+  - Shows branch name in the footer
+  - View staged, modified, and untracked files
+  - Stage all changes, write a commit message, and push - all without leaving the TUI
 - **Keyboard & mouse support**: Full keyboard navigation + mouse clicking/scrolling
 - **VSCode integration**: Optimized for VSCode integrated terminal
 
@@ -150,6 +155,7 @@ That's it! The TUI will:
 - `Mouse wheel` - Scroll output
 
 *Other:*
+- `g` - Open git modal (commit & push, only in git repos)
 - `o` - Open settings
 - `q` - Quit (stops all processes)
 - `Ctrl+C` - Force quit
@@ -170,6 +176,17 @@ That's it! The TUI will:
 
 **Quick Commands Overlay:**
 - `Esc` - Close overlay and stop command (if running)
+
+**Git Modal** (press `g` from Running Screen, only in git repos):
+- `a` - Stage all changes
+- `c` - Start writing commit message
+- `p` - Push to remote
+- `r` - Refresh git status
+- `↑`/`↓` - Navigate file list
+- `Esc` or `q` - Close git modal
+- When writing commit message:
+  - `Enter` - Stage all and commit
+  - `Esc` - Cancel and go back to status
 
 ## Why Build This?
 
