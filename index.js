@@ -606,6 +606,10 @@ class ProcessManager {
     this.paneLineCount = new Map();  // Track how many lines we've rendered per pane
     this.uiJustRebuilt = false;  // Flag to skip redundant render after buildRunningUI
     
+    // Column view state (one pane per script, side by side)
+    this.isColumnView = false;       // Whether column view is active
+    this.savedPaneRoot = null;       // Saved pane tree to restore when toggling back
+    
     // Copy mode state (select text to copy)
     this.isCopyMode = false;       // Whether in copy/select mode
     this.copyModeCursor = 0;       // Current cursor line index within visible lines
@@ -842,14 +846,17 @@ class ProcessManager {
           this.buildRunningUI();
         } else if (keyName === '|') {
           // Quick vertical split
+          this.exitColumnViewMode();
           this.splitCurrentPane('vertical');
           this.buildRunningUI();
         } else if (keyName === '_') {
           // Quick horizontal split
+          this.exitColumnViewMode();
           this.splitCurrentPane('horizontal');
           this.buildRunningUI();
         } else if (keyName === 'x' && getAllPaneIds(this.paneRoot).length > 1) {
           // Close current pane (only if more than one)
+          this.exitColumnViewMode();
           this.closeCurrentPane();
           this.buildRunningUI();
         } else if (keyName === 'space') {
@@ -985,6 +992,9 @@ class ProcessManager {
         } else if (keyName === 'y') {
           // Enter copy mode (select text to copy)
           this.enterCopyMode();
+        } else if (keyName === '=') {
+          // Toggle column view (one pane per script)
+          this.toggleColumnView();
         } else if (keyName === 'g' && IS_GIT_REPO) {
           // Open git modal (commit & push)
           this.openGitModal();
@@ -1674,6 +1684,67 @@ class ProcessManager {
     }
   }
   
+  // Generate a column view pane tree: one pane per running script, side by side
+  generateColumnViewPaneTree() {
+    // Get the scripts that are currently selected/running
+    const runningScripts = this.scripts.filter(s => {
+      const proc = this.processes.get(s.name);
+      return proc && (proc.status === 'running' || proc.status === 'crashed' || proc.status === 'exited');
+    });
+    
+    if (runningScripts.length === 0) {
+      return createPane([]);
+    }
+    
+    if (runningScripts.length === 1) {
+      return createPane([runningScripts[0].name]);
+    }
+    
+    // Create a vertical split with one pane per script
+    const panes = runningScripts.map(s => {
+      const pane = createPane([s.name]);
+      pane.name = s.displayName;
+      return pane;
+    });
+    
+    return createSplit('vertical', panes);
+  }
+  
+  // Toggle between column view (one pane per script) and the normal saved layout
+  toggleColumnView() {
+    if (this.isColumnView) {
+      // Restore the saved pane tree
+      if (this.savedPaneRoot) {
+        this.paneRoot = this.savedPaneRoot;
+        this.savedPaneRoot = null;
+      } else {
+        this.paneRoot = createPane([]);
+      }
+      this.isColumnView = false;
+    } else {
+      // Save current pane tree and switch to column view
+      this.savedPaneRoot = this.paneRoot;
+      this.paneRoot = this.generateColumnViewPaneTree();
+      this.isColumnView = true;
+    }
+    
+    // Focus the first pane in the new tree
+    const allPanes = getAllPaneIds(this.paneRoot);
+    if (allPanes.length > 0) {
+      this.focusedPaneId = allPanes[0];
+    }
+    
+    this.buildRunningUI();
+  }
+  
+  // Exit column view mode without restoring saved layout (e.g. user manually split/closed a pane)
+  exitColumnViewMode() {
+    if (this.isColumnView) {
+      this.isColumnView = false;
+      this.savedPaneRoot = null;
+    }
+  }
+  
   // Move the currently selected process to the focused pane
   moveProcessToCurrentPane() {
     const scriptName = this.scripts[this.selectedIndex]?.name;
@@ -1760,6 +1831,8 @@ class ProcessManager {
   
   // Save the current pane layout to config (debounced to avoid excessive disk writes)
   savePaneLayout() {
+    // Don't save the auto-generated column view layout - it's transient
+    if (this.isColumnView) return;
     this.config.paneLayout = serializePaneTree(this.paneRoot);
     debouncedSaveConfig(this.config);
   }
@@ -4176,6 +4249,15 @@ class ProcessManager {
     });
     leftSide.add(statusIndicator);
     
+    // Column view indicator
+    if (this.isColumnView) {
+      const columnIndicator = new TextRenderable(this.renderer, {
+        id: 'column-view-indicator',
+        content: t`${fg(COLORS.cyan)('COLUMNS')}`,
+      });
+      leftSide.add(columnIndicator);
+    }
+    
     // Git branch indicator
     if (IS_GIT_REPO) {
       const branch = this.gitBranch || getGitBranch();
@@ -4286,6 +4368,7 @@ class ProcessManager {
       // Pane & navigation
       [
         { key: '\\', desc: 'panes', color: COLORS.cyan },
+        { key: '=', desc: this.isColumnView ? 'merged' : 'columns', color: COLORS.cyan },
         { key: '1-9', desc: 'toggle', color: COLORS.success },
       ],
       // Process control

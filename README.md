@@ -43,6 +43,7 @@ Traditional solutions fall short:
   - Per-process visibility toggles (`Space` or `1-9`)
   - Per-pane filters (different views in each pane)
 - **Custom pane naming**: Label panes for easier identification (`n`)
+- **Column view**: Instant one-pane-per-script layout with `=` key (toggle back to restore your layout)
 - **Persistent layouts**: Your pane configuration is saved between sessions
 - **Process-specific views**: Show/hide specific processes in each pane
 - **Colored output**: Each process gets unique color-coded output
@@ -122,6 +123,7 @@ That's it! The TUI will:
 - `\` - Open command palette
 - `|` - Split pane vertically (left/right)
 - `_` - Split pane horizontally (top/bottom)
+- `=` - Toggle column view (one column per script, auto-generated)
 - `x` - Close current pane (if >1 pane exists)
 - `Tab` - Next pane
 - `Shift+Tab` - Previous pane
