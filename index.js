@@ -429,6 +429,15 @@ function gitPush() {
   }
 }
 
+function gitPull() {
+  try {
+    const output = execSync('git pull', { stdio: 'pipe', windowsHide: true, timeout: 30000 }).toString().trim();
+    return { success: true, output: output || 'Pulled successfully' };
+  } catch (err) {
+    return { success: false, error: err.stderr?.toString() || err.message };
+  }
+}
+
 // Detect git repo once at startup
 const IS_GIT_REPO = isGitRepo();
 
@@ -2665,6 +2674,22 @@ class ProcessManager {
           this.refreshGitStatus();
           this.buildRunningUI();
         }, 10);
+      } else if (keyName === 'l') {
+        // Pull
+        this.gitModalPhase = 'pulling';
+        this.gitModalOutput = ['Pulling...'];
+        this.buildRunningUI();
+        setTimeout(() => {
+          const result = gitPull();
+          if (result.success) {
+            this.gitModalOutput = [result.output];
+          } else {
+            this.gitModalOutput = [`Pull failed: ${result.error}`];
+          }
+          this.gitModalPhase = 'result';
+          this.refreshGitStatus();
+          this.buildRunningUI();
+        }, 10);
       } else if (keyName === 'r') {
         // Refresh status
         this.refreshGitStatus();
@@ -2738,6 +2763,22 @@ class ProcessManager {
             this.gitModalOutput = [result.output];
           } else {
             this.gitModalOutput = [`Push failed: ${result.error}`];
+          }
+          this.gitModalPhase = 'result';
+          this.refreshGitStatus();
+          this.buildRunningUI();
+        }, 10);
+      } else if (keyName === 'l') {
+        // Allow pulling from result phase
+        this.gitModalPhase = 'pulling';
+        this.gitModalOutput = ['Pulling...'];
+        this.buildRunningUI();
+        setTimeout(() => {
+          const result = gitPull();
+          if (result.success) {
+            this.gitModalOutput = [result.output];
+          } else {
+            this.gitModalOutput = [`Pull failed: ${result.error}`];
           }
           this.gitModalPhase = 'result';
           this.refreshGitStatus();
@@ -3835,6 +3876,7 @@ class ProcessManager {
     let titleIcon = '';
     if (this.gitModalPhase === 'committing') titleIcon = '...';
     else if (this.gitModalPhase === 'pushing') titleIcon = '...';
+    else if (this.gitModalPhase === 'pulling') titleIcon = '...';
     else titleIcon = '';
     const title = ` Git: ${branch} ${titleIcon}`;
     
@@ -3924,9 +3966,9 @@ class ProcessManager {
         content: t`${fg(COLORS.textDim)('All changes will be staged and committed.')}`,
       });
       overlay.add(commitHint);
-    } else if (this.gitModalPhase === 'committing' || this.gitModalPhase === 'pushing') {
+    } else if (this.gitModalPhase === 'committing' || this.gitModalPhase === 'pushing' || this.gitModalPhase === 'pulling') {
       // Show busy indicator
-      const busyText = this.gitModalPhase === 'committing' ? 'Committing...' : 'Pushing...';
+      const busyText = this.gitModalPhase === 'committing' ? 'Committing...' : this.gitModalPhase === 'pushing' ? 'Pushing...' : 'Pulling...';
       const busyLine = new TextRenderable(this.renderer, {
         id: 'git-busy',
         content: t`${fg(COLORS.warning)(busyText)}`,
@@ -4080,7 +4122,7 @@ class ProcessManager {
         });
         hintBar.add(hint);
       });
-    } else if (this.gitModalPhase === 'committing' || this.gitModalPhase === 'pushing') {
+    } else if (this.gitModalPhase === 'committing' || this.gitModalPhase === 'pushing' || this.gitModalPhase === 'pulling') {
       const hint = new TextRenderable(this.renderer, {
         id: 'git-hint-busy',
         content: t`${fg(COLORS.warning)('Please wait...')}`,
@@ -4091,6 +4133,7 @@ class ProcessManager {
         { key: 'c', desc: 'commit', color: COLORS.success },
         { key: 'a', desc: 'stage all', color: COLORS.warning },
         { key: 'p', desc: 'push', color: COLORS.cyan },
+        { key: 'l', desc: 'pull', color: COLORS.cyan },
         { key: 'r', desc: 'refresh', color: COLORS.magenta },
         { key: 'esc', desc: 'close', color: COLORS.error },
       ];
