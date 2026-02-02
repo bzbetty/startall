@@ -660,6 +660,16 @@ class ProcessManager {
         return;
       }
       
+      // Handle Ctrl+L - clear screen buffer and redraw
+      if (key.ctrl && key.name === 'l') {
+        if (this.phase === 'running') {
+          this.outputLines = [];
+          this.totalLinesReceived = 0;
+          this.buildRunningUI();
+        }
+        return;
+      }
+      
       this.handleInput(key.name, key);
       this.render();
     });
@@ -4290,6 +4300,7 @@ class ProcessManager {
         { key: '/', desc: 'filter', color: COLORS.cyan },
         { key: 'c', desc: 'color', color: COLORS.magenta },
         { key: 'y', desc: 'copy', color: COLORS.accent },
+        { key: '^L', desc: 'clear', color: COLORS.cyan },
       ],
       // Misc
       [
