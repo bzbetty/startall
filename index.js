@@ -6,6 +6,158 @@ import { readFileSync, writeFileSync, writeSync, existsSync } from 'fs';
 import { join } from 'path';
 import kill from 'tree-kill';
 import stripAnsi from 'strip-ansi';
+import Database from 'better-sqlite3';
+
+// SQLite-backed output line storage
+class OutputDatabase {
+  constructor(maxLines = 1000) {
+    this.db = new Database(':memory:');
+    this.maxLines = maxLines;
+
+    // Enable WAL mode for better concurrent read/write performance
+    this.db.pragma('journal_mode = WAL');
+
+    // Create the output_lines table
+    this.db.exec(`
+      CREATE TABLE output_lines (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        line_number INTEGER NOT NULL,
+        process TEXT NOT NULL,
+        process_lower TEXT NOT NULL,
+        text TEXT NOT NULL,
+        text_lower TEXT NOT NULL,
+        timestamp INTEGER NOT NULL
+      )
+    `);
+    this.db.exec('CREATE INDEX idx_line_number ON output_lines(line_number)');
+    this.db.exec('CREATE INDEX idx_process ON output_lines(process)');
+
+    // Column list with aliases to match existing JS property names
+    this._columns = 'id, line_number AS lineNumber, process, process_lower AS processLower, text, text_lower AS textLower, timestamp';
+
+    // Prepare reusable statements for performance
+    this._insertStmt = this.db.prepare(
+      'INSERT INTO output_lines (line_number, process, process_lower, text, text_lower, timestamp) VALUES (?, ?, ?, ?, ?, ?)'
+    );
+    this._countStmt = this.db.prepare('SELECT COUNT(*) AS cnt FROM output_lines');
+    this._deleteOldStmt = this.db.prepare(
+      'DELETE FROM output_lines WHERE id NOT IN (SELECT id FROM output_lines ORDER BY id DESC LIMIT ?)'
+    );
+    this._selectAllStmt = this.db.prepare(`SELECT ${this._columns} FROM output_lines ORDER BY id ASC`);
+    this._clearStmt = this.db.prepare('DELETE FROM output_lines');
+  }
+
+  insert(lineNumber, process, text, timestamp) {
+    this._insertStmt.run(lineNumber, process, process.toLowerCase(), text, text.toLowerCase(), timestamp);
+
+    // Enforce max lines limit
+    const { cnt } = this._countStmt.get();
+    if (cnt > this.maxLines) {
+      this._deleteOldStmt.run(this.maxLines);
+    }
+  }
+
+  getAll() {
+    return this._selectAllStmt.all();
+  }
+
+  count() {
+    return this._countStmt.get().cnt;
+  }
+
+  clear() {
+    this._clearStmt.run();
+  }
+
+  // Query with pane filters applied via SQL
+  queryForPane(pane) {
+    const hasProcessFilter = pane.processes && pane.processes.length > 0;
+    const hasHiddenFilter = pane.hidden && pane.hidden.length > 0;
+    const hasTextFilter = !!pane.filter;
+    const hasColorFilter = !!pane.colorFilter;
+
+    // If color filter is active, we can't do that in SQL (needs ANSI parsing),
+    // so we fetch everything else via SQL and filter color in JS
+    const conditions = [];
+    const params = [];
+
+    if (hasProcessFilter) {
+      const placeholders = pane.processes.map(() => '?').join(', ');
+      conditions.push(`process IN (${placeholders})`);
+      params.push(...pane.processes);
+    }
+
+    if (hasHiddenFilter) {
+      const placeholders = pane.hidden.map(() => '?').join(', ');
+      conditions.push(`process NOT IN (${placeholders})`);
+      params.push(...pane.hidden);
+    }
+
+    if (hasTextFilter) {
+      const filterLower = pane.filter.toLowerCase();
+      conditions.push('(process_lower LIKE ? OR text_lower LIKE ?)');
+      params.push(`%${filterLower}%`, `%${filterLower}%`);
+    }
+
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    const sql = `SELECT ${this._columns} FROM output_lines ${where} ORDER BY id ASC`;
+
+    let rows = this.db.prepare(sql).all(...params);
+
+    // Apply color filter in JS (requires ANSI parsing)
+    if (hasColorFilter) {
+      rows = rows.filter(line => lineHasColor(line.text, pane.colorFilter));
+    }
+
+    return rows;
+  }
+
+  // Query lines newer than a given line_number, with pane filters
+  queryNewLines(afterLineNumber, pane, limit) {
+    const conditions = ['line_number > ?'];
+    const params = [afterLineNumber];
+
+    const hasProcessFilter = pane.processes && pane.processes.length > 0;
+    const hasHiddenFilter = pane.hidden && pane.hidden.length > 0;
+    const hasTextFilter = !!pane.filter;
+    const hasColorFilter = !!pane.colorFilter;
+
+    if (hasProcessFilter) {
+      const placeholders = pane.processes.map(() => '?').join(', ');
+      conditions.push(`process IN (${placeholders})`);
+      params.push(...pane.processes);
+    }
+
+    if (hasHiddenFilter) {
+      const placeholders = pane.hidden.map(() => '?').join(', ');
+      conditions.push(`process NOT IN (${placeholders})`);
+      params.push(...pane.hidden);
+    }
+
+    if (hasTextFilter) {
+      const filterLower = pane.filter.toLowerCase();
+      conditions.push('(process_lower LIKE ? OR text_lower LIKE ?)');
+      params.push(`%${filterLower}%`, `%${filterLower}%`);
+    }
+
+    const where = `WHERE ${conditions.join(' AND ')}`;
+    // Get newest lines up to limit, but return them in ascending order
+    const sql = `SELECT ${this._columns} FROM (SELECT * FROM output_lines ${where} ORDER BY id DESC LIMIT ?) ORDER BY id ASC`;
+    params.push(limit);
+
+    let rows = this.db.prepare(sql).all(...params);
+
+    if (hasColorFilter) {
+      rows = rows.filter(line => lineHasColor(line.text, pane.colorFilter));
+    }
+
+    return rows;
+  }
+
+  close() {
+    this.db.close();
+  }
+}
 
 // Configuration
 const CONFIG_FILE = process.argv[2] || 'startall.json';
@@ -550,10 +702,10 @@ class ProcessManager {
     this.selectedIndex = 0;
     this.processes = new Map();
     this.processRefs = new Map();
-    this.outputLines = [];
+    this.maxOutputLines = 1000;  // Lines kept in database
+    this.outputDb = new OutputDatabase(this.maxOutputLines);
     this.totalLinesReceived = 0;  // Track total lines ever received (never resets)
     this.filter = '';
-    this.maxOutputLines = 1000;  // Lines kept in memory
     this.maxDomLines = 150;  // Lines kept in DOM (buffer for varying heights)
     this.lineRenderables = new Map();  // Reusable TextRenderables per pane
     this.maxVisibleLines = null;  // Calculated dynamically based on screen height
@@ -676,7 +828,7 @@ class ProcessManager {
       // Handle Ctrl+L - clear screen buffer and redraw
       if (key.ctrl && key.name === 'l') {
         if (this.phase === 'running') {
-          this.outputLines = [];
+          this.outputDb.clear();
           this.totalLinesReceived = 0;
           this.buildRunningUI();
         }
@@ -1157,21 +1309,14 @@ class ProcessManager {
 
   addOutputLine(processName, text) {
     // Always store the output line, even when paused
-    // Pre-compute lowercase for faster filtering
-    this.outputLines.push({
-      process: processName,
-      processLower: processName.toLowerCase(),
+    // Insert into SQLite database
+    this.outputDb.insert(
+      ++this.totalLinesReceived,
+      processName,
       text,
-      textLower: text.toLowerCase(),
-      timestamp: Date.now(),
-      lineNumber: ++this.totalLinesReceived,  // Track absolute line number
-    });
-    
-    // Use shift() instead of slice() to avoid creating new array
-    while (this.outputLines.length > this.maxOutputLines) {
-      this.outputLines.shift();
-    }
-    
+      Date.now()
+    );
+
     // Only render if not paused - this prevents new output from appearing
     // when the user is reviewing history
     if (!this.isPaused) {
@@ -2098,47 +2243,9 @@ class ProcessManager {
   }
   
   // Count horizontal splits (which reduce available height per pane)
-  // Get output lines for a specific pane - optimized single-pass filtering
+  // Get output lines for a specific pane - queries SQLite with filters
   getOutputLinesForPane(pane) {
-    // Early return if no filters active
-    const hasProcessFilter = pane.processes.length > 0;
-    const hasHiddenFilter = pane.hidden && pane.hidden.length > 0;
-    const hasTextFilter = !!pane.filter;
-    const hasColorFilter = !!pane.colorFilter;
-    
-    if (!hasProcessFilter && !hasHiddenFilter && !hasTextFilter && !hasColorFilter) {
-      return this.outputLines;
-    }
-    
-    // Build Sets for O(1) lookups
-    const processSet = hasProcessFilter ? new Set(pane.processes) : null;
-    const hiddenSet = hasHiddenFilter ? new Set(pane.hidden) : null;
-    const filterLower = hasTextFilter ? pane.filter.toLowerCase() : null;
-    
-    // Single pass through lines
-    return this.outputLines.filter(line => {
-      // Check process filter
-      if (processSet && !processSet.has(line.process)) return false;
-      
-      // Check hidden filter
-      if (hiddenSet && hiddenSet.has(line.process)) return false;
-      
-      // Check text filter (use cached lowercase from line if available)
-      if (filterLower) {
-        const processLower = line.processLower || line.process.toLowerCase();
-        const textLower = line.textLower || line.text.toLowerCase();
-        if (!processLower.includes(filterLower) && !textLower.includes(filterLower)) {
-          return false;
-        }
-      }
-      
-      // Check color filter
-      if (hasColorFilter && !lineHasColor(line.text, pane.colorFilter)) {
-        return false;
-      }
-      
-      return true;
-    });
+    return this.outputDb.queryForPane(pane);
   }
   
   buildSettingsUI() {
@@ -2538,6 +2645,11 @@ class ProcessManager {
       } catch (err) {
         // Ignore
       }
+    }
+
+    // Close the SQLite database
+    if (this.outputDb) {
+      this.outputDb.close();
     }
   }
   
@@ -3080,7 +3192,7 @@ class ProcessManager {
   
   getPerformanceString() {
     const metrics = this.getPerformanceMetrics();
-    return `${metrics.fps}fps ${metrics.avgRenderTime}ms mem:${this.outputLines.length}`;
+    return `${metrics.fps}fps ${metrics.avgRenderTime}ms db:${this.outputDb.count()}`;
   }
 
   getProcessListContent() {
@@ -3246,28 +3358,9 @@ class ProcessManager {
         }
         
         const lastRenderedLineNumber = this.paneLineCount.get(paneId) || 0;
-          
-          // Cache filter values outside loop
-          const hasProcessFilter = pane.processes.length > 0;
-          const processSet = hasProcessFilter ? new Set(pane.processes) : null;
-          const hasHiddenFilter = pane.hidden && pane.hidden.length > 0;
-          const hiddenSet = hasHiddenFilter ? new Set(pane.hidden) : null;
-          const filterLower = pane.filter ? pane.filter.toLowerCase() : null;
-          const colorFilter = pane.colorFilter;
-          
-          // Only look at lines newer than what we've rendered - avoid filtering all lines
-          let newLines = [];
-          for (let i = this.outputLines.length - 1; i >= 0; i--) {
-            const line = this.outputLines[i];
-            if (line.lineNumber <= lastRenderedLineNumber) break;
-            // Apply pane filters inline with cached values
-            if (processSet && !processSet.has(line.process)) continue;
-            if (hiddenSet && hiddenSet.has(line.process)) continue;
-            if (filterLower && !line.processLower.includes(filterLower) && !line.textLower.includes(filterLower)) continue;
-            if (colorFilter && !lineHasColor(line.text, colorFilter)) continue;
-            newLines.unshift(line);
-            if (newLines.length >= maxLinesPerUpdate) break;
-          }
+
+          // Query SQLite for new lines matching pane filters
+          const newLines = this.outputDb.queryNewLines(lastRenderedLineNumber, pane, maxLinesPerUpdate);
           
           if (newLines.length > 0) {
             // Get or create renderable pool for this pane
