@@ -891,15 +891,25 @@ class ProcessManager {
       
       // Handle Ctrl+L - clear screen and redraw (kills artifacts)
       if (key.ctrl && key.name === 'l') {
-        // Clear the terminal screen
-        process.stdout.write('\x1b[2J\x1b[H');
-        if (this.phase === 'running') {
-          this.buildRunningUI();
-        } else if (this.phase === 'selection') {
-          this.buildSelectionUI();
-        } else if (this.phase === 'settings') {
-          this.buildSettingsUI();
+        // Debounce - cancel any pending wipe and restart
+        if (this.wipeTimeout) {
+          clearTimeout(this.wipeTimeout);
         }
+        
+        // Save current phase and show wipe screen
+        const savedPhase = this.phase;
+        this.buildWipeScreen();
+        
+        this.wipeTimeout = setTimeout(() => {
+          this.wipeTimeout = null;
+          if (savedPhase === 'running') {
+            this.buildRunningUI();
+          } else if (savedPhase === 'selection') {
+            this.buildSelectionUI();
+          } else if (savedPhase === 'settings') {
+            this.buildSettingsUI();
+          }
+        }, 50);
         return;
       }
       
@@ -2358,6 +2368,11 @@ class ProcessManager {
   
   buildSettingsUI() {
     // Remove old containers - use destroyRecursively to clean up all children
+    if (this.wipeContainer) {
+      this.renderer.root.remove(this.wipeContainer);
+      this.wipeContainer.destroyRecursively();
+      this.wipeContainer = null;
+    }
     if (this.selectionContainer) {
       this.renderer.root.remove(this.selectionContainer);
       this.selectionContainer.destroyRecursively();
@@ -3013,8 +3028,56 @@ class ProcessManager {
     // 'committing' and 'pushing' phases ignore input (busy)
   }
 
+  // Full screen wipe to clear artifacts (Ctrl+L)
+  buildWipeScreen() {
+    // Remove old containers
+    if (this.selectionContainer) {
+      this.renderer.root.remove(this.selectionContainer);
+      this.selectionContainer.destroyRecursively();
+      this.selectionContainer = null;
+    }
+    if (this.settingsContainer) {
+      this.renderer.root.remove(this.settingsContainer);
+      this.settingsContainer.destroyRecursively();
+      this.settingsContainer = null;
+    }
+    if (this.runningContainer) {
+      this.renderer.root.remove(this.runningContainer);
+      this.runningContainer.destroyRecursively();
+      this.runningContainer = null;
+      this.outputBox = null;
+      this.paneScrollBoxes.clear();
+      this.paneOutputBoxes.clear();
+      this.lineRenderables.clear();
+    }
+    
+    // Create full-screen wipe with different background color
+    const wipeContainer = new BoxRenderable(this.renderer, {
+      id: 'wipe-container',
+      width: '100%',
+      height: '100%',
+      backgroundColor: COLORS.bg,
+      justifyContent: 'center',
+      alignItems: 'center',
+    });
+    
+    const wipeText = new TextRenderable(this.renderer, {
+      id: 'wipe-text',
+      content: t`${fg(COLORS.textDim)('Clearing...')}`,
+    });
+    wipeContainer.add(wipeText);
+    
+    this.renderer.root.add(wipeContainer);
+    this.wipeContainer = wipeContainer;
+  }
+
   buildSelectionUI() {
     // Remove old containers if they exist - use destroyRecursively to clean up all children
+    if (this.wipeContainer) {
+      this.renderer.root.remove(this.wipeContainer);
+      this.wipeContainer.destroyRecursively();
+      this.wipeContainer = null;
+    }
     if (this.selectionContainer) {
       this.renderer.root.remove(this.selectionContainer);
       this.selectionContainer.destroyRecursively();
@@ -4397,6 +4460,11 @@ class ProcessManager {
     }
     
     // Remove old containers if they exist - use destroyRecursively to clean up all children
+    if (this.wipeContainer) {
+      this.renderer.root.remove(this.wipeContainer);
+      this.wipeContainer.destroyRecursively();
+      this.wipeContainer = null;
+    }
     if (this.selectionContainer) {
       this.renderer.root.remove(this.selectionContainer);
       this.selectionContainer.destroyRecursively();
