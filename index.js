@@ -7,6 +7,7 @@ import { join } from 'path';
 import kill from 'tree-kill';
 import stripAnsi from 'strip-ansi';
 import { Database } from 'bun:sqlite';
+import { StringDecoder } from 'string_decoder';
 
 // SQLite-backed output line storage
 class OutputDatabase {
@@ -1358,9 +1359,19 @@ class ProcessManager {
       shell: true,
     });
 
+    // Use StringDecoder to properly handle multi-byte UTF-8 characters
+    // that may be split across data chunks
+    const stdoutDecoder = new StringDecoder('utf8');
+    const stderrDecoder = new StringDecoder('utf8');
+    let stdoutBuffer = '';
+    let stderrBuffer = '';
+
     proc.stdout.on('data', (data) => {
-      const text = data.toString();
-      const lines = text.split('\n');
+      // Decode properly handles partial multi-byte characters
+      stdoutBuffer += stdoutDecoder.write(data);
+      const lines = stdoutBuffer.split('\n');
+      // Keep the last incomplete line in the buffer
+      stdoutBuffer = lines.pop();
       lines.forEach(line => {
         if (line.trim()) {
           this.addOutputLine(scriptName, line);
@@ -1369,8 +1380,11 @@ class ProcessManager {
     });
 
     proc.stderr.on('data', (data) => {
-      const text = data.toString();
-      const lines = text.split('\n');
+      // Decode properly handles partial multi-byte characters
+      stderrBuffer += stderrDecoder.write(data);
+      const lines = stderrBuffer.split('\n');
+      // Keep the last incomplete line in the buffer
+      stderrBuffer = lines.pop();
       lines.forEach(line => {
         if (line.trim()) {
           this.addOutputLine(scriptName, line);
@@ -1379,6 +1393,16 @@ class ProcessManager {
     });
 
     proc.on('exit', (code) => {
+      // Flush any remaining buffered content from the decoders
+      const remainingStdout = stdoutBuffer + stdoutDecoder.end();
+      const remainingStderr = stderrBuffer + stderrDecoder.end();
+      if (remainingStdout.trim()) {
+        this.addOutputLine(scriptName, remainingStdout);
+      }
+      if (remainingStderr.trim()) {
+        this.addOutputLine(scriptName, remainingStderr);
+      }
+      
       const status = code === 0 ? 'exited' : 'crashed';
       this.processes.set(scriptName, { status, exitCode: code });
       this.addOutputLine(scriptName, `Process exited with code ${code}`);
