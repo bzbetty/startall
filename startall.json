@@ -28,20 +28,56 @@
         "colorFilter": null
       },
       {
-        "type": "pane",
-        "name": "",
-        "processes": [],
-        "hidden": [],
-        "filter": "",
-        "colorFilter": null
+        "type": "split",
+        "direction": "horizontal",
+        "sizes": [
+          1,
+          1
+        ],
+        "children": [
+          {
+            "type": "pane",
+            "name": "",
+            "processes": [],
+            "hidden": [],
+            "filter": "",
+            "colorFilter": null
+          },
+          {
+            "type": "pane",
+            "name": "",
+            "processes": [],
+            "hidden": [],
+            "filter": "",
+            "colorFilter": null
+          }
+        ]
       },
       {
-        "type": "pane",
-        "name": "",
-        "processes": [],
-        "hidden": [],
-        "filter": "",
-        "colorFilter": null
+        "type": "split",
+        "direction": "horizontal",
+        "sizes": [
+          1,
+          1
+        ],
+        "children": [
+          {
+            "type": "pane",
+            "name": "",
+            "processes": [],
+            "hidden": [],
+            "filter": "",
+            "colorFilter": null
+          },
+          {
+            "type": "pane",
+            "name": "",
+            "processes": [],
+            "hidden": [],
+            "filter": "",
+            "colorFilter": null
+          }
+        ]
       }
     ]
   },
