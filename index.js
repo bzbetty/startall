@@ -1,11 +1,183 @@
 #!/usr/bin/env bun
 
-import { createCliRenderer, TextRenderable, BoxRenderable, ScrollBoxRenderable, ASCIIFontRenderable, t, fg, bold, dim, RGBA } from '@opentui/core';
+import { createCliRenderer, TextRenderable, BoxRenderable, ScrollBoxRenderable, ASCIIFontRenderable, TextareaRenderable, SyntaxStyle, parseColor, t, fg, bg, bold, dim, RGBA, StyledText, OptimizedBuffer } from '@opentui/core';
 import { spawn, execSync, spawnSync } from 'child_process';
 import { readFileSync, writeFileSync, writeSync, existsSync } from 'fs';
 import { join } from 'path';
 import kill from 'tree-kill';
 import stripAnsi from 'strip-ansi';
+import { Database } from 'bun:sqlite';
+
+// SQLite-backed output line storage
+class OutputDatabase {
+  constructor(maxLines = 1000) {
+    this.db = new Database(':memory:');
+    this.maxLines = maxLines;
+
+    // Enable WAL mode for better concurrent read/write performance
+    this.db.exec('PRAGMA journal_mode = WAL');
+
+    // Create the output_lines table with colors bitmask for efficient filtering
+    this.db.exec(`
+      CREATE TABLE output_lines (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        line_number INTEGER NOT NULL,
+        process TEXT NOT NULL,
+        process_lower TEXT NOT NULL,
+        text TEXT NOT NULL,
+        text_lower TEXT NOT NULL,
+        timestamp INTEGER NOT NULL,
+        colors INTEGER NOT NULL DEFAULT 0
+      )
+    `);
+    this.db.exec('CREATE INDEX idx_line_number ON output_lines(line_number)');
+    this.db.exec('CREATE INDEX idx_process ON output_lines(process)');
+    this.db.exec('CREATE INDEX idx_colors ON output_lines(colors)');
+
+    // Column list with aliases to match existing JS property names
+    this._columns = 'id, line_number AS lineNumber, process, process_lower AS processLower, text, text_lower AS textLower, timestamp, colors';
+
+    // Prepare reusable statements for performance
+    this._insertStmt = this.db.prepare(
+      'INSERT INTO output_lines (line_number, process, process_lower, text, text_lower, timestamp, colors) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    );
+    this._countStmt = this.db.prepare('SELECT COUNT(*) AS cnt FROM output_lines');
+    this._deleteOldStmt = this.db.prepare(
+      'DELETE FROM output_lines WHERE id NOT IN (SELECT id FROM output_lines ORDER BY id DESC LIMIT ?)'
+    );
+    this._selectAllStmt = this.db.prepare(`SELECT ${this._columns} FROM output_lines ORDER BY id ASC`);
+    this._clearStmt = this.db.prepare('DELETE FROM output_lines');
+    // Fast path for queryVisible with no filters
+    this._queryVisibleNoFilterStmt = this.db.prepare(`SELECT ${this._columns} FROM (
+      SELECT * FROM output_lines ORDER BY id DESC LIMIT ?
+    ) ORDER BY id ASC`);
+  }
+
+  insert(lineNumber, process, text, timestamp, colorBitmask) {
+    this._insertStmt.run(lineNumber, process, process.toLowerCase(), text, text.toLowerCase(), timestamp, colorBitmask);
+
+    // Enforce max lines limit
+    const { cnt } = this._countStmt.get();
+    if (cnt > this.maxLines) {
+      this._deleteOldStmt.run(this.maxLines);
+    }
+  }
+
+  getAll() {
+    return this._selectAllStmt.all();
+  }
+
+  count() {
+    return this._countStmt.get().cnt;
+  }
+
+  clear() {
+    this._clearStmt.run();
+  }
+
+  // Build SQL conditions and params for pane filters
+  _buildPaneFilters(pane) {
+    const conditions = [];
+    const params = [];
+
+    if (pane.processes && pane.processes.length > 0) {
+      const placeholders = pane.processes.map(() => '?').join(', ');
+      conditions.push(`process IN (${placeholders})`);
+      params.push(...pane.processes);
+    }
+
+    if (pane.hidden && pane.hidden.length > 0) {
+      const placeholders = pane.hidden.map(() => '?').join(', ');
+      conditions.push(`process NOT IN (${placeholders})`);
+      params.push(...pane.hidden);
+    }
+
+    if (pane.filter) {
+      const filterLower = pane.filter.toLowerCase();
+      conditions.push('(process_lower LIKE ? OR text_lower LIKE ?)');
+      params.push(`%${filterLower}%`, `%${filterLower}%`);
+    }
+
+    if (pane.colorFilter) {
+      // Use bitmask check: (colors & bit) != 0
+      const colorBit = this._getColorBit(pane.colorFilter);
+      if (colorBit > 0) {
+        conditions.push('(colors & ?) != 0');
+        params.push(colorBit);
+      }
+    }
+
+    return { conditions, params };
+  }
+
+  // Get color bitmask value for a color name
+  _getColorBit(colorName) {
+    const bits = { red: 1, yellow: 2, green: 4, blue: 8, cyan: 16, magenta: 32 };
+    return bits[colorName] || 0;
+  }
+
+  // Query with pane filters applied via SQL
+  queryForPane(pane) {
+    const { conditions, params } = this._buildPaneFilters(pane);
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    const sql = `SELECT ${this._columns} FROM output_lines ${where} ORDER BY id ASC`;
+    return this.db.prepare(sql).all(...params);
+  }
+
+  // Query lines newer than a given line_number, with pane filters
+  queryNewLines(afterLineNumber, pane, limit) {
+    const { conditions, params } = this._buildPaneFilters(pane);
+    conditions.unshift('line_number > ?');
+    params.unshift(afterLineNumber);
+
+    const where = `WHERE ${conditions.join(' AND ')}`;
+    // Get newest lines up to limit, but return them in ascending order
+    const sql = `SELECT ${this._columns} FROM (SELECT * FROM output_lines ${where} ORDER BY id DESC LIMIT ?) ORDER BY id ASC`;
+    params.push(limit);
+
+    return this.db.prepare(sql).all(...params);
+  }
+
+  // Count lines matching pane filters (for calculating max scroll)
+  countForPane(pane) {
+    const { conditions, params } = this._buildPaneFilters(pane);
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    const sql = `SELECT COUNT(*) AS cnt FROM output_lines ${where}`;
+    return this.db.prepare(sql).get(...params).cnt;
+  }
+
+  // Query visible lines for virtual scrolling: get `limit` lines starting from `offset` from the end
+  // offset=0 means the most recent lines, offset=10 means 10 lines back from the end
+  queryVisible(pane, limit, offsetFromEnd) {
+    const { conditions, params } = this._buildPaneFilters(pane);
+    const totalToFetch = limit + offsetFromEnd;
+    
+    let rows;
+    if (conditions.length === 0) {
+      // Fast path: no filters, use prepared statement
+      rows = this._queryVisibleNoFilterStmt.all(totalToFetch);
+    } else {
+      // Slow path: build query with filters
+      const where = `WHERE ${conditions.join(' AND ')}`;
+      const sql = `SELECT ${this._columns} FROM (
+        SELECT * FROM output_lines ${where} ORDER BY id DESC LIMIT ?
+      ) ORDER BY id ASC`;
+      params.push(totalToFetch);
+      rows = this.db.prepare(sql).all(...params);
+    }
+    
+    // If offset > 0, trim the newest lines
+    if (offsetFromEnd > 0 && rows.length > limit) {
+      rows = rows.slice(0, limit);
+    }
+    
+    return rows;
+  }
+
+  close() {
+    this.db.close();
+  }
+}
 
 // Configuration
 const CONFIG_FILE = process.argv[2] || 'startall.json';
@@ -93,32 +265,63 @@ function getAllPaneIds(node, ids = []) {
   return ids;
 }
 
+// Color bitmask values for efficient SQL filtering
+const COLOR_BITS = {
+  red: 1,      // 0b000001
+  yellow: 2,   // 0b000010
+  green: 4,    // 0b000100
+  blue: 8,     // 0b001000
+  cyan: 16,    // 0b010000
+  magenta: 32, // 0b100000
+};
+
+// ANSI color codes (normal and bright variants)
+const ANSI_COLOR_CODES = {
+  red: [31, 91],
+  yellow: [33, 93],
+  green: [32, 92],
+  blue: [34, 94],
+  cyan: [36, 96],
+  magenta: [35, 95],
+};
+
 // Get ANSI color codes for a color name (includes normal and bright variants)
 function getAnsiColorCodes(colorName) {
-  const colorMap = {
-    red: [31, 91],      // normal red, bright red
-    yellow: [33, 93],   // normal yellow, bright yellow (warnings)
-    green: [32, 92],    // normal green, bright green
-    blue: [34, 94],     // normal blue, bright blue
-    cyan: [36, 96],     // normal cyan, bright cyan
-    magenta: [35, 95],  // normal magenta, bright magenta
-  };
-  return colorMap[colorName] || [];
+  return ANSI_COLOR_CODES[colorName] || [];
+}
+
+// Check if text contains a specific ANSI color code
+function textHasColorCode(text, code) {
+  // Check for direct color code: \x1b[31m
+  if (text.includes(`\x1b[${code}m`)) return true;
+  // Check for color with modifiers: \x1b[1;31m, \x1b[0;31m, etc.
+  if (text.includes(`;${code}m`)) return true;
+  // Check for color at start of sequence: \x1b[31;1m
+  if (text.includes(`\x1b[${code};`)) return true;
+  return false;
 }
 
 // Check if a line contains a specific ANSI color
 function lineHasColor(text, colorName) {
   const codes = getAnsiColorCodes(colorName);
-  // Match ANSI escape sequences like \x1b[31m, \x1b[91m, \x1b[1;31m, etc.
   for (const code of codes) {
-    // Check for direct color code: \x1b[31m
-    if (text.includes(`\x1b[${code}m`)) return true;
-    // Check for color with modifiers: \x1b[1;31m, \x1b[0;31m, etc.
-    if (text.includes(`;${code}m`)) return true;
-    // Check for color at start of sequence: \x1b[31;1m
-    if (text.includes(`\x1b[${code};`)) return true;
+    if (textHasColorCode(text, code)) return true;
   }
   return false;
+}
+
+// Detect all colors in text and return bitmask
+function detectColorBitmask(text) {
+  let bitmask = 0;
+  for (const [colorName, codes] of Object.entries(ANSI_COLOR_CODES)) {
+    for (const code of codes) {
+      if (textHasColorCode(text, code)) {
+        bitmask |= COLOR_BITS[colorName];
+        break; // Found this color, no need to check other codes for it
+      }
+    }
+  }
+  return bitmask;
 }
 
 // Find parent of a node
@@ -550,10 +753,10 @@ class ProcessManager {
     this.selectedIndex = 0;
     this.processes = new Map();
     this.processRefs = new Map();
-    this.outputLines = [];
+    this.maxOutputLines = 1000;  // Lines kept in database
+    this.outputDb = new OutputDatabase(this.maxOutputLines);
     this.totalLinesReceived = 0;  // Track total lines ever received (never resets)
     this.filter = '';
-    this.maxOutputLines = 1000;  // Lines kept in memory
     this.maxDomLines = 150;  // Lines kept in DOM (buffer for varying heights)
     this.lineRenderables = new Map();  // Reusable TextRenderables per pane
     this.maxVisibleLines = null;  // Calculated dynamically based on screen height
@@ -590,11 +793,12 @@ class ProcessManager {
     this.outputBox = null;  // Reference to the output container
     this.destroyed = false;  // Flag to prevent operations after cleanup
     this.lastRenderedLineCount = 0;  // Track how many lines we've rendered
+    this.hasNewLines = false;  // Flag set when new lines are added, cleared after render
     this.headerRenderable = null;  // Reference to header text in running UI
     this.processListRenderable = null;  // Reference to process list text in running UI
     this.renderScheduled = false;  // Throttle renders for CPU efficiency
     this.lastRenderTime = 0;  // Timestamp of last render
-    this.minRenderInterval = 100;  // Minimum ms between renders (~10fps cap)
+    this.minRenderInterval = 1;  // Minimum ms between renders (~60fps cap)
     
     // Performance metrics
     this.showPerformanceMetrics = this.config.showPerformanceMetrics || false;
@@ -609,15 +813,27 @@ class ProcessManager {
     this.splitMode = false;  // Whether waiting for split command after Ctrl+b
     this.showSplitMenu = false;  // Whether to show the command palette
     this.splitMenuIndex = 0;  // Selected item in split menu
-    this.paneScrollPositions = new Map();  // Store scroll positions per pane ID
-    this.paneScrollBoxes = new Map();  // Store ScrollBox references per pane ID
+    this.paneScrollPositions = new Map();  // Store scroll positions per pane ID (legacy)
+    this.paneScrollBoxes = new Map();  // Store ScrollBox references per pane ID (legacy)
     this.paneFilterState = new Map();  // Track filter state per pane to detect changes
     this.paneLineCount = new Map();  // Track how many lines we've rendered per pane
     this.uiJustRebuilt = false;  // Flag to skip redundant render after buildRunningUI
     
+    // Virtual scrolling state
+    this.paneScrollOffsets = new Map();  // Scroll offset from end per pane (0 = at bottom)
+    this.paneVisibleHeight = new Map();  // Visible height per pane for scroll calculations
+    this.paneOutputBoxes = new Map();  // Store output BoxRenderable references per pane
+    
     // Column view state (one pane per script, side by side)
     this.isColumnView = false;       // Whether column view is active
     this.savedPaneRoot = null;       // Saved pane tree to restore when toggling back
+    
+    // Line format cache (keyed by line ID + settings hash)
+    this.lineFormatCache = new Map();
+    this.lineFormatCacheKey = '';  // Cache key based on display settings
+    
+    // Pane content cache (keyed by pane ID -> {lastLineId, styledText})
+    this.paneContentCache = new Map();
     
     // Copy mode state (select text to copy)
     this.isCopyMode = false;       // Whether in copy/select mode
@@ -673,13 +889,27 @@ class ProcessManager {
         return;
       }
       
-      // Handle Ctrl+L - clear screen buffer and redraw
+      // Handle Ctrl+L - clear screen and redraw (kills artifacts)
       if (key.ctrl && key.name === 'l') {
-        if (this.phase === 'running') {
-          this.outputLines = [];
-          this.totalLinesReceived = 0;
-          this.buildRunningUI();
+        // Debounce - cancel any pending wipe and restart
+        if (this.wipeTimeout) {
+          clearTimeout(this.wipeTimeout);
         }
+        
+        // Save current phase and show wipe screen
+        const savedPhase = this.phase;
+        this.buildWipeScreen();
+        
+        this.wipeTimeout = setTimeout(() => {
+          this.wipeTimeout = null;
+          if (savedPhase === 'running') {
+            this.buildRunningUI();
+          } else if (savedPhase === 'selection') {
+            this.buildSelectionUI();
+          } else if (savedPhase === 'settings') {
+            this.buildSettingsUI();
+          }
+        }, 50);
         return;
       }
       
@@ -874,13 +1104,13 @@ class ProcessManager {
           this.buildRunningUI();
         } else if (keyName === 'p') {
           // Toggle pause output scrolling globally
-          // Save scroll positions before rebuild
-          for (const [paneId, scrollBox] of this.paneScrollBoxes.entries()) {
-            if (scrollBox && scrollBox.scrollY !== undefined) {
-              this.paneScrollPositions.set(paneId, { x: 0, y: scrollBox.scrollY });
+          this.isPaused = !this.isPaused;
+          // Reset scroll offset to bottom when unpausing
+          if (!this.isPaused) {
+            for (const paneId of getAllPaneIds(this.paneRoot)) {
+              this.paneScrollOffsets.set(paneId, 0);
             }
           }
-          this.isPaused = !this.isPaused;
           this.updateStreamPauseState();
           this.buildRunningUI();
         } else if (keyName === 'f') {
@@ -1103,13 +1333,16 @@ class ProcessManager {
     } else {
       this.paneRoot = createPane([]); // Empty array means show all processes
     }
-    this.focusedPaneId = this.paneRoot.id;
+    // Focus the first actual pane (paneRoot might be a split node)
+    const allPanes = getAllPaneIds(this.paneRoot);
+    this.focusedPaneId = allPanes.length > 0 ? allPanes[0] : this.paneRoot.id;
     
     selected.forEach(scriptName => {
       this.startProcess(scriptName);
     });
     
-    this.render();
+    // Build the UI immediately (don't rely on render() since hasNewLines may be false)
+    this.buildRunningUI();
   }
 
   startProcess(scriptName) {
@@ -1156,22 +1389,25 @@ class ProcessManager {
   }
 
   addOutputLine(processName, text) {
+    // Don't write if database is closed
+    if (this.destroyed) return;
+    
+    // Detect colors in the text for efficient SQL filtering
+    const colorBitmask = detectColorBitmask(text);
+    
     // Always store the output line, even when paused
-    // Pre-compute lowercase for faster filtering
-    this.outputLines.push({
-      process: processName,
-      processLower: processName.toLowerCase(),
+    // Insert into SQLite database
+    this.outputDb.insert(
+      ++this.totalLinesReceived,
+      processName,
       text,
-      textLower: text.toLowerCase(),
-      timestamp: Date.now(),
-      lineNumber: ++this.totalLinesReceived,  // Track absolute line number
-    });
-    
-    // Use shift() instead of slice() to avoid creating new array
-    while (this.outputLines.length > this.maxOutputLines) {
-      this.outputLines.shift();
-    }
-    
+      Date.now(),
+      colorBitmask
+    );
+
+    // Mark that new lines are available
+    this.hasNewLines = true;
+
     // Only render if not paused - this prevents new output from appearing
     // when the user is reviewing history
     if (!this.isPaused) {
@@ -1820,19 +2056,38 @@ class ProcessManager {
   // Toggle visibility of selected process in focused pane
   toggleProcessVisibility() {
     const scriptName = this.scripts[this.selectedIndex]?.name;
-    if (!scriptName || !this.focusedPaneId) return;
+    if (!scriptName || !this.focusedPaneId) {
+      return;
+    }
     
     const pane = findPaneById(this.paneRoot, this.focusedPaneId);
-    if (!pane) return;
+    if (!pane) {
+      return;
+    }
     
-    // Initialize hidden array if needed
+    // Initialize arrays if needed
     if (!pane.hidden) pane.hidden = [];
+    if (!pane.processes) pane.processes = [];
     
-    // Toggle: if hidden, show it; if visible, hide it
-    if (pane.hidden.includes(scriptName)) {
-      pane.hidden = pane.hidden.filter(p => p !== scriptName);
+    // Check current visibility
+    const isCurrentlyVisible = this.isProcessVisibleInPane(scriptName, pane);
+    
+    if (isCurrentlyVisible) {
+      // Hide it - add to hidden list
+      if (!pane.hidden.includes(scriptName)) {
+        pane.hidden.push(scriptName);
+      }
+      // Also remove from processes if it's there
+      if (pane.processes.includes(scriptName)) {
+        pane.processes = pane.processes.filter(p => p !== scriptName);
+      }
     } else {
-      pane.hidden.push(scriptName);
+      // Show it - remove from hidden list
+      pane.hidden = pane.hidden.filter(p => p !== scriptName);
+      // If pane has a process filter, add this process to it
+      if (pane.processes.length > 0 && !pane.processes.includes(scriptName)) {
+        pane.processes.push(scriptName);
+      }
     }
     
     this.savePaneLayout();
@@ -1846,38 +2101,46 @@ class ProcessManager {
     debouncedSaveConfig(this.config);
   }
   
-  // Scroll the focused pane
+  // Scroll the focused pane (virtual scrolling - adjusts offset into database)
   scrollFocusedPane(direction) {
     if (!this.focusedPaneId) return;
     
-    const scrollBox = this.paneScrollBoxes.get(this.focusedPaneId);
-    if (!scrollBox || !scrollBox.scrollTo) return;
+    const pane = findPaneById(this.paneRoot, this.focusedPaneId);
+    if (!pane) return;
     
-    const currentY = scrollBox.scrollTop || 0;
-    const viewportHeight = scrollBox.height || 20;
-    const contentHeight = scrollBox.contentHeight || 0;
+    const totalLines = this.outputDb.countForPane(pane);
+    const visibleHeight = this.paneVisibleHeight.get(this.focusedPaneId) || 20;
+    const currentOffset = this.paneScrollOffsets.get(this.focusedPaneId) || 0;
+    const maxOffset = Math.max(0, totalLines - visibleHeight);
     
-    let newY = currentY;
+    let newOffset = currentOffset;
     
     if (direction === 'home') {
-      newY = 0;
+      // Scroll to top (maximum offset from end)
+      newOffset = maxOffset;
     } else if (direction === 'end') {
-      newY = Number.MAX_SAFE_INTEGER;
+      // Scroll to bottom (offset 0 = most recent)
+      newOffset = 0;
     } else if (direction === 'pageup') {
-      newY = Math.max(0, currentY - viewportHeight);
+      newOffset = Math.min(maxOffset, currentOffset + visibleHeight);
     } else if (direction === 'pagedown') {
-      newY = Math.min(contentHeight - viewportHeight, currentY + viewportHeight);
+      newOffset = Math.max(0, currentOffset - visibleHeight);
+    } else if (direction === 'up') {
+      newOffset = Math.min(maxOffset, currentOffset + 1);
+    } else if (direction === 'down') {
+      newOffset = Math.max(0, currentOffset - 1);
     }
     
-    scrollBox.scrollTo({ x: 0, y: newY });
-    
-    // Save the new scroll position
-    this.paneScrollPositions.set(this.focusedPaneId, { x: 0, y: newY });
-    
-    // Auto-pause when manually scrolling (unless going to end)
-    if (direction !== 'end' && !this.isPaused) {
-      this.isPaused = true;
-      this.updateStreamPauseState();
+    // Only update if changed
+    if (newOffset !== currentOffset) {
+      this.paneScrollOffsets.set(this.focusedPaneId, newOffset);
+      
+      // Auto-pause when manually scrolling (unless going to end)
+      if (direction !== 'end' && !this.isPaused) {
+        this.isPaused = true;
+        this.updateStreamPauseState();
+      }
+      
       this.buildRunningUI();
     }
   }
@@ -2098,51 +2361,18 @@ class ProcessManager {
   }
   
   // Count horizontal splits (which reduce available height per pane)
-  // Get output lines for a specific pane - optimized single-pass filtering
+  // Get output lines for a specific pane - queries SQLite with filters
   getOutputLinesForPane(pane) {
-    // Early return if no filters active
-    const hasProcessFilter = pane.processes.length > 0;
-    const hasHiddenFilter = pane.hidden && pane.hidden.length > 0;
-    const hasTextFilter = !!pane.filter;
-    const hasColorFilter = !!pane.colorFilter;
-    
-    if (!hasProcessFilter && !hasHiddenFilter && !hasTextFilter && !hasColorFilter) {
-      return this.outputLines;
-    }
-    
-    // Build Sets for O(1) lookups
-    const processSet = hasProcessFilter ? new Set(pane.processes) : null;
-    const hiddenSet = hasHiddenFilter ? new Set(pane.hidden) : null;
-    const filterLower = hasTextFilter ? pane.filter.toLowerCase() : null;
-    
-    // Single pass through lines
-    return this.outputLines.filter(line => {
-      // Check process filter
-      if (processSet && !processSet.has(line.process)) return false;
-      
-      // Check hidden filter
-      if (hiddenSet && hiddenSet.has(line.process)) return false;
-      
-      // Check text filter (use cached lowercase from line if available)
-      if (filterLower) {
-        const processLower = line.processLower || line.process.toLowerCase();
-        const textLower = line.textLower || line.text.toLowerCase();
-        if (!processLower.includes(filterLower) && !textLower.includes(filterLower)) {
-          return false;
-        }
-      }
-      
-      // Check color filter
-      if (hasColorFilter && !lineHasColor(line.text, pane.colorFilter)) {
-        return false;
-      }
-      
-      return true;
-    });
+    return this.outputDb.queryForPane(pane);
   }
   
   buildSettingsUI() {
     // Remove old containers - use destroyRecursively to clean up all children
+    if (this.wipeContainer) {
+      this.renderer.root.remove(this.wipeContainer);
+      this.wipeContainer.destroyRecursively();
+      this.wipeContainer = null;
+    }
     if (this.selectionContainer) {
       this.renderer.root.remove(this.selectionContainer);
       this.selectionContainer.destroyRecursively();
@@ -2539,6 +2769,11 @@ class ProcessManager {
         // Ignore
       }
     }
+
+    // Close the SQLite database
+    if (this.outputDb) {
+      this.outputDb.close();
+    }
   }
   
   executeCommand(scriptName) {
@@ -2793,8 +3028,56 @@ class ProcessManager {
     // 'committing' and 'pushing' phases ignore input (busy)
   }
 
+  // Full screen wipe to clear artifacts (Ctrl+L)
+  buildWipeScreen() {
+    // Remove old containers
+    if (this.selectionContainer) {
+      this.renderer.root.remove(this.selectionContainer);
+      this.selectionContainer.destroyRecursively();
+      this.selectionContainer = null;
+    }
+    if (this.settingsContainer) {
+      this.renderer.root.remove(this.settingsContainer);
+      this.settingsContainer.destroyRecursively();
+      this.settingsContainer = null;
+    }
+    if (this.runningContainer) {
+      this.renderer.root.remove(this.runningContainer);
+      this.runningContainer.destroyRecursively();
+      this.runningContainer = null;
+      this.outputBox = null;
+      this.paneScrollBoxes.clear();
+      this.paneOutputBoxes.clear();
+      this.lineRenderables.clear();
+    }
+    
+    // Create full-screen wipe with different background color
+    const wipeContainer = new BoxRenderable(this.renderer, {
+      id: 'wipe-container',
+      width: '100%',
+      height: '100%',
+      backgroundColor: COLORS.bg,
+      justifyContent: 'center',
+      alignItems: 'center',
+    });
+    
+    const wipeText = new TextRenderable(this.renderer, {
+      id: 'wipe-text',
+      content: t`${fg(COLORS.textDim)('Clearing...')}`,
+    });
+    wipeContainer.add(wipeText);
+    
+    this.renderer.root.add(wipeContainer);
+    this.wipeContainer = wipeContainer;
+  }
+
   buildSelectionUI() {
     // Remove old containers if they exist - use destroyRecursively to clean up all children
+    if (this.wipeContainer) {
+      this.renderer.root.remove(this.wipeContainer);
+      this.wipeContainer.destroyRecursively();
+      this.wipeContainer = null;
+    }
     if (this.selectionContainer) {
       this.renderer.root.remove(this.selectionContainer);
       this.selectionContainer.destroyRecursively();
@@ -3080,7 +3363,9 @@ class ProcessManager {
   
   getPerformanceString() {
     const metrics = this.getPerformanceMetrics();
-    return `${metrics.fps}fps ${metrics.avgRenderTime}ms mem:${this.outputLines.length}`;
+    const rendererStats = this.renderer.getStats ? this.renderer.getStats() : null;
+    const rendererFps = rendererStats ? rendererStats.fps : '?';
+    return `${metrics.fps}fps ${metrics.avgRenderTime}ms r:${rendererFps}fps db:${this.outputDb.count()}`;
   }
 
   getProcessListContent() {
@@ -3219,109 +3504,79 @@ class ProcessManager {
       }
     }
     
-    // Update existing panes incrementally, or rebuild if needed
-    if (this.paneScrollBoxes.size > 0) {
-      // Incremental update - just append new lines to existing panes
-      const maxLinesPerUpdate = 200;  // Limit lines added per render
-      // When live, limit DOM to screen height (no scroll needed)
-      // When paused, keep all for scrollback  
-      const screenHeight = this.renderer.height || 50;
-      const maxDomLinesPerPane = this.isPaused ? this.maxOutputLines : screenHeight;
-      
-      for (const [paneId, scrollBox] of this.paneScrollBoxes.entries()) {
+    // Skip update if paused or no new lines
+    if (this.isPaused || !this.hasNewLines) return;
+    
+    // Clear the flag
+    this.hasNewLines = false;
+    
+    // Virtual scrolling update - only update visible lines from database
+    if (this.paneOutputBoxes.size > 0) {
+      for (const [paneId, outputBox] of this.paneOutputBoxes.entries()) {
         const pane = findPaneById(this.paneRoot, paneId);
-        if (!pane || !scrollBox || !scrollBox.content) {
-          // ScrollBox invalid, need full rebuild
+        if (!pane || !outputBox) {
           this.buildRunningUI();
           return;
         }
         
-        // Only update focused pane every frame, others less frequently
-        const isFocused = paneId === this.focusedPaneId;
-        if (!isFocused && this.paneScrollBoxes.size > 1) {
-          const lastUpdate = this.paneLastUpdate?.get(paneId) || 0;
-          if (now - lastUpdate < 200) continue;  // Update non-focused panes every 200ms
-          if (!this.paneLastUpdate) this.paneLastUpdate = new Map();
-          this.paneLastUpdate.set(paneId, now);
+        // Only update if at the bottom (offset=0)
+        const scrollOffset = this.paneScrollOffsets.get(paneId) || 0;
+        if (scrollOffset !== 0) continue;
+        
+        const visibleHeight = this.paneVisibleHeight.get(paneId) || 20;
+        const lines = this.outputDb.queryVisible(pane, visibleHeight, 0);
+        
+        // Skip if no lines or last line hasn't changed
+        if (lines.length === 0) continue;
+        const lastLineNum = lines[lines.length - 1].lineNumber;
+        const prevLastLine = this.paneLineCount.get(paneId) || 0;
+        if (lastLineNum === prevLastLine) continue;
+        
+        // Check pane content cache - if first line ID matches, we can append
+        const firstLineId = lines[0].id;
+        const cache = this.paneContentCache.get(paneId);
+        
+        let styledText;
+        if (cache && cache.firstLineId === firstLineId && cache.lineCount === lines.length - 1) {
+          // Only 1 new line at the end - append to cached chunks
+          const newLine = lines[lines.length - 1];
+          const newLineContent = this.formatOutputLine(newLine, lines.length - 1, false, -1, -1);
+          const chunks = cache.chunks.concat(newLineContent.chunks);
+          styledText = new StyledText(chunks);
+          this.paneContentCache.set(paneId, { firstLineId, lineCount: lines.length, chunks });
+        } else {
+          // Full rebuild
+          const chunks = [];
+          for (let i = 0; i < lines.length; i++) {
+            const lineContent = this.formatOutputLine(lines[i], i, false, -1, -1);
+            for (let j = 0; j < lineContent.chunks.length; j++) {
+              chunks.push(lineContent.chunks[j]);
+            }
+          }
+          styledText = new StyledText(chunks);
+          this.paneContentCache.set(paneId, { firstLineId, lineCount: lines.length, chunks });
         }
         
-        const lastRenderedLineNumber = this.paneLineCount.get(paneId) || 0;
-          
-          // Cache filter values outside loop
-          const hasProcessFilter = pane.processes.length > 0;
-          const processSet = hasProcessFilter ? new Set(pane.processes) : null;
-          const hasHiddenFilter = pane.hidden && pane.hidden.length > 0;
-          const hiddenSet = hasHiddenFilter ? new Set(pane.hidden) : null;
-          const filterLower = pane.filter ? pane.filter.toLowerCase() : null;
-          const colorFilter = pane.colorFilter;
-          
-          // Only look at lines newer than what we've rendered - avoid filtering all lines
-          let newLines = [];
-          for (let i = this.outputLines.length - 1; i >= 0; i--) {
-            const line = this.outputLines[i];
-            if (line.lineNumber <= lastRenderedLineNumber) break;
-            // Apply pane filters inline with cached values
-            if (processSet && !processSet.has(line.process)) continue;
-            if (hiddenSet && hiddenSet.has(line.process)) continue;
-            if (filterLower && !line.processLower.includes(filterLower) && !line.textLower.includes(filterLower)) continue;
-            if (colorFilter && !lineHasColor(line.text, colorFilter)) continue;
-            newLines.unshift(line);
-            if (newLines.length >= maxLinesPerUpdate) break;
-          }
-          
-          if (newLines.length > 0) {
-            // Get or create renderable pool for this pane
-            if (!this.lineRenderables.has(paneId)) {
-              this.lineRenderables.set(paneId, []);
-            }
-            const renderables = this.lineRenderables.get(paneId);
-            
-            // Add new lines - reuse existing renderables or create new ones
-            for (const line of newLines) {
-              const processColor = this.processColors.get(line.process) || COLORS.text;
-              
-              // Build content
-              const lineNumber = this.showLineNumbers ? String(line.lineNumber).padStart(4, ' ') : '';
-              const timestamp = this.showTimestamps ? (line.timeString || (line.timeString = new Date(line.timestamp).toLocaleTimeString('en-US', { hour12: false }))) : '';
-              
-              let content;
-              if (this.showLineNumbers && this.showTimestamps) {
-                content = t`${fg(COLORS.textDim)(lineNumber)} ${fg(COLORS.textDim)(`[${timestamp}]`)} ${fg(processColor)(`[${line.process}]`)} ${line.text}`;
-              } else if (this.showLineNumbers) {
-                content = t`${fg(COLORS.textDim)(lineNumber)} ${fg(processColor)(`[${line.process}]`)} ${line.text}`;
-              } else if (this.showTimestamps) {
-                content = t`${fg(COLORS.textDim)(`[${timestamp}]`)} ${fg(processColor)(`[${line.process}]`)} ${line.text}`;
-              } else {
-                content = t`${fg(processColor)(`[${line.process}]`)} ${line.text}`;
-              }
-              
-              // Create new renderable and add to pool
-              const outputLine = new TextRenderable(this.renderer, {
-                id: `output-${pane.id}-${line.lineNumber}`,
-                content: content,
-                bg: '#000000',
-              });
-              
-              scrollBox.content.add(outputLine);
-              renderables.push(outputLine);
-            }
-            
-            // Remove excess old lines - keep DOM small for performance
-            while (renderables.length > maxDomLinesPerPane) {
-              const oldLine = renderables.shift();
-              scrollBox.content.remove(oldLine);
-              oldLine.destroy();
-            }
-            
-            // Update to track the last absolute line number we rendered
-            this.paneLineCount.set(paneId, newLines[newLines.length - 1].lineNumber);
-            
-            // Auto-scroll to bottom if not paused
-            if (!this.isPaused && scrollBox.scrollTo) {
-              scrollBox.scrollTo({ x: 0, y: Number.MAX_SAFE_INTEGER });
-            }
-          }
+        // Destroy old renderable and create new one to avoid artifacts
+        const renderables = this.lineRenderables.get(paneId);
+        if (renderables && renderables.length > 0) {
+          outputBox.remove(renderables[0]);
+          renderables[0].destroy();
         }
+        
+        // Create new TextRenderable
+        const outputText = new TextRenderable(this.renderer, {
+          id: `output-${paneId}`,
+          content: styledText,
+          bg: '#000000',
+          width: '100%',
+        });
+        outputBox.add(outputText);
+        this.lineRenderables.set(paneId, [outputText]);
+        
+        // Track last rendered line
+        this.paneLineCount.set(paneId, lastLineNum);
+      }
     } else {
       // First time or no panes exist - do full rebuild
       this.buildRunningUI();
@@ -3336,9 +3591,8 @@ class ProcessManager {
     }
     
     // Remove old process bar items
-    while (this.processBarContainer.children && this.processBarContainer.children.length > 0) {
-      const child = this.processBarContainer.children[0];
-      this.processBarContainer.remove(child);
+    for (const child of this.processBarContainer.getChildren()) {
+      this.processBarContainer.remove(child.id);
       child.destroy();
     }
     
@@ -3355,7 +3609,7 @@ class ProcessManager {
       const isVisible = this.isProcessVisibleInPane(script.name, focusedPane);
       const nameColor = isSelected ? COLORS.accent : (isVisible ? processColor : COLORS.textDim);
       const numberColor = isVisible ? processColor : COLORS.textDim;
-      const indicator = isSelected ? '>' : ' ';
+      const indicator = isSelected ? '❯' : ' ';
       const bracketColor = isVisible ? processColor : COLORS.textDim;
       
       const numberLabel = index < 9 ? `${index + 1}` : ' ';
@@ -3375,7 +3629,83 @@ class ProcessManager {
     });
   }
   
-  // Build a single pane's output area
+  // Get cache key for current display settings
+  getFormatCacheKey() {
+    return `${this.showLineNumbers}-${this.showTimestamps}-${this.renderer.width}`;
+  }
+  
+  // Format a single line for display (returns styled text chunks)
+  formatOutputLine(line, index, inCopyMode, copySelStart, copySelEnd) {
+    // Copy mode can't use cache (dynamic highlighting)
+    if (inCopyMode) {
+      return this.formatOutputLineCopyMode(line, index, copySelStart, copySelEnd);
+    }
+    
+    // Can't cache if we're padding to width (width can vary)
+    // Check cache only if no padding needed
+    const cacheKey = this.getFormatCacheKey();
+    if (cacheKey !== this.lineFormatCacheKey) {
+      // Settings changed, clear cache
+      this.lineFormatCache.clear();
+      this.lineFormatCacheKey = cacheKey;
+    }
+    
+    // Format line
+    const processColor = this.processColors.get(line.process) || COLORS.text;
+    const lineNumber = this.showLineNumbers ? String(line.lineNumber).padStart(4, ' ') : '';
+    const timestamp = this.showTimestamps ? (line.timeString || (line.timeString = new Date(line.timestamp).toLocaleTimeString('en-US', { hour12: false }))) : '';
+    
+    let result;
+    if (this.showLineNumbers && this.showTimestamps) {
+      result = t`${fg(COLORS.textDim)(lineNumber)} ${fg(COLORS.textDim)(`[${timestamp}]`)} ${fg(processColor)(`[${line.process}]`)} ${line.text}\n`;
+    } else if (this.showLineNumbers) {
+      result = t`${fg(COLORS.textDim)(lineNumber)} ${fg(processColor)(`[${line.process}]`)} ${line.text}\n`;
+    } else if (this.showTimestamps) {
+      result = t`${fg(COLORS.textDim)(`[${timestamp}]`)} ${fg(processColor)(`[${line.process}]`)} ${line.text}\n`;
+    } else {
+      result = t`${fg(processColor)(`[${line.process}]`)} ${line.text}\n`;
+    }
+    
+    return result;
+  }
+  
+  // Format line in copy mode (no caching - dynamic highlighting)
+  formatOutputLineCopyMode(line, index, copySelStart, copySelEnd) {
+    const processColor = this.processColors.get(line.process) || COLORS.text;
+    const lineNumber = this.showLineNumbers ? String(line.lineNumber).padStart(4, ' ') : '';
+    const timestamp = this.showTimestamps ? (line.timeString || (line.timeString = new Date(line.timestamp).toLocaleTimeString('en-US', { hour12: false }))) : '';
+    
+    const isCursorLine = index === this.copyModeCursor;
+    const isSelectedLine = index >= copySelStart && index <= copySelEnd;
+    
+    const marker = isCursorLine ? fg(COLORS.copyCursorText)('\u25b6 ') : '  ';
+    let textColor, procColor, dimColor;
+    if (isCursorLine) {
+      textColor = COLORS.copyCursorText;
+      procColor = COLORS.copyCursorText;
+      dimColor = COLORS.copySelectText;
+    } else if (isSelectedLine) {
+      textColor = COLORS.copySelectText;
+      procColor = processColor;
+      dimColor = COLORS.textDim;
+    } else {
+      textColor = COLORS.textDim;
+      procColor = COLORS.textDim;
+      dimColor = COLORS.textDim;
+    }
+    
+    if (this.showLineNumbers && this.showTimestamps) {
+      return t`${marker}${fg(dimColor)(lineNumber)} ${fg(dimColor)(`[${timestamp}]`)} ${fg(procColor)(`[${line.process}]`)} ${fg(textColor)(line.text)}\n`;
+    } else if (this.showLineNumbers) {
+      return t`${marker}${fg(dimColor)(lineNumber)} ${fg(procColor)(`[${line.process}]`)} ${fg(textColor)(line.text)}\n`;
+    } else if (this.showTimestamps) {
+      return t`${marker}${fg(dimColor)(`[${timestamp}]`)} ${fg(procColor)(`[${line.process}]`)} ${fg(textColor)(line.text)}\n`;
+    } else {
+      return t`${marker}${fg(procColor)(`[${line.process}]`)} ${fg(textColor)(line.text)}\n`;
+    }
+  }
+  
+  // Build a single pane's output area - uses single TextRenderable for efficiency
   buildPaneOutput(pane, container, height) {
     const isFocused = pane.id === this.focusedPaneId;
     const lines = this.getOutputLinesForPane(pane);
@@ -3385,89 +3715,33 @@ class ProcessManager {
     const maxLines = this.isPaused ? lines.length : Math.min(lines.length, height || 50);
     const linesToShow = lines.slice(-maxLines);
     
-    // Initialize renderable pool for this pane
-    const renderables = [];
-    this.lineRenderables.set(pane.id, renderables);
-    
     // Determine copy mode selection range for this pane
     const inCopyMode = this.isCopyMode && isFocused;
     let copySelStart = -1;
     let copySelEnd = -1;
-    if (inCopyMode) {
-      if (this.copyModeAnchor !== null) {
-        copySelStart = Math.min(this.copyModeAnchor, this.copyModeCursor);
-        copySelEnd = Math.max(this.copyModeAnchor, this.copyModeCursor);
-      }
+    if (inCopyMode && this.copyModeAnchor !== null) {
+      copySelStart = Math.min(this.copyModeAnchor, this.copyModeCursor);
+      copySelEnd = Math.max(this.copyModeAnchor, this.copyModeCursor);
     }
     
-    // Add lines (oldest first, so newest is at bottom)
+    // Build all lines as a single styled text (much more efficient than one renderable per line)
+    const chunks = [];
     for (let i = 0; i < linesToShow.length; i++) {
-      const line = linesToShow[i];
-      const processColor = this.processColors.get(line.process) || COLORS.text;
-      
-      // Build content with proper template literal
-      const lineNumber = this.showLineNumbers ? String(line.lineNumber).padStart(4, ' ') : '';
-      const timestamp = this.showTimestamps ? new Date(line.timestamp).toLocaleTimeString('en-US', { hour12: false }) : '';
-      
-      // Determine copy mode highlighting for this line
-      const isCursorLine = inCopyMode && i === this.copyModeCursor;
-      const isSelectedLine = inCopyMode && i >= copySelStart && i <= copySelEnd;
-      
-      let content;
-      if (inCopyMode) {
-        // In copy mode: cursor line gets bright marker + white text on blue bg
-        // Selected lines get lighter text on darker blue bg
-        // Unselected lines are dimmed to make selection stand out
-        const marker = isCursorLine ? fg(COLORS.copyCursorText)('\u25b6 ') : '  ';
-        
-        let textColor, procColor, dimColor;
-        if (isCursorLine) {
-          textColor = COLORS.copyCursorText;
-          procColor = COLORS.copyCursorText;
-          dimColor = COLORS.copySelectText;
-        } else if (isSelectedLine) {
-          textColor = COLORS.copySelectText;
-          procColor = processColor;
-          dimColor = COLORS.textDim;
-        } else {
-          textColor = COLORS.textDim;
-          procColor = COLORS.textDim;
-          dimColor = COLORS.textDim;
-        }
-        
-        if (this.showLineNumbers && this.showTimestamps) {
-          content = t`${marker}${fg(dimColor)(lineNumber)} ${fg(dimColor)(`[${timestamp}]`)} ${fg(procColor)(`[${line.process}]`)} ${fg(textColor)(line.text)}`;
-        } else if (this.showLineNumbers) {
-          content = t`${marker}${fg(dimColor)(lineNumber)} ${fg(procColor)(`[${line.process}]`)} ${fg(textColor)(line.text)}`;
-        } else if (this.showTimestamps) {
-          content = t`${marker}${fg(dimColor)(`[${timestamp}]`)} ${fg(procColor)(`[${line.process}]`)} ${fg(textColor)(line.text)}`;
-        } else {
-          content = t`${marker}${fg(procColor)(`[${line.process}]`)} ${fg(textColor)(line.text)}`;
-        }
-      } else {
-        if (this.showLineNumbers && this.showTimestamps) {
-          content = t`${fg(COLORS.textDim)(lineNumber)} ${fg(COLORS.textDim)(`[${timestamp}]`)} ${fg(processColor)(`[${line.process}]`)} ${line.text}`;
-        } else if (this.showLineNumbers) {
-          content = t`${fg(COLORS.textDim)(lineNumber)} ${fg(processColor)(`[${line.process}]`)} ${line.text}`;
-        } else if (this.showTimestamps) {
-          content = t`${fg(COLORS.textDim)(`[${timestamp}]`)} ${fg(processColor)(`[${line.process}]`)} ${line.text}`;
-        } else {
-          content = t`${fg(processColor)(`[${line.process}]`)} ${line.text}`;
-        }
-      }
-      
-      // High-contrast background: bright blue for cursor, medium blue for selected, black for rest
-      const bgColor = isCursorLine ? COLORS.copyCursorBg : (isSelectedLine ? COLORS.copySelectBg : '#000000');
-      
-      const outputLine = new TextRenderable(this.renderer, {
-        id: `output-${pane.id}-${line.lineNumber}`,
-        content: content,
-        bg: bgColor,
-      });
-      
-      container.add(outputLine);
-      renderables.push(outputLine);
+      const lineContent = this.formatOutputLine(linesToShow[i], i, inCopyMode, copySelStart, copySelEnd);
+      chunks.push(...lineContent.chunks);
     }
+    
+    // Create single TextRenderable with all content
+    const outputText = new TextRenderable(this.renderer, {
+      id: `output-${pane.id}`,
+      content: new StyledText(chunks),
+      bg: '#000000',
+    });
+    
+    container.add(outputText);
+    
+    // Store reference for incremental updates
+    this.lineRenderables.set(pane.id, [outputText]);
     
     // Track last rendered line number
     if (linesToShow.length > 0) {
@@ -3488,7 +3762,7 @@ class ProcessManager {
     }
   }
   
-  // Build a pane panel with title bar
+  // Build a pane panel with title bar - uses virtual scrolling (no ScrollBox)
   buildPanePanel(pane, flexGrow = 1, availableHeight = null) {
     const isFocused = pane.id === this.focusedPaneId;
     const borderColor = isFocused ? COLORS.borderFocused : COLORS.border;
@@ -3504,14 +3778,20 @@ class ProcessManager {
     const filterLabel = pane.filter ? ` /${pane.filter}` : '';
     const namingInputLabel = (isFocused && this.isNamingMode) ? `Name: ${this.namingModeText}_` : '';
     const filterInputLabel = (isFocused && this.isFilterMode) ? `/${pane.filter || ''}_` : '';
-    const title = ` ${focusLabel}${namingInputLabel || processLabel}${hiddenLabel}${filterInputLabel || filterLabel} `;
+    
+    // Show scroll position indicator when paused
+    const scrollOffset = this.paneScrollOffsets.get(pane.id) || 0;
+    const totalLines = this.outputDb.countForPane(pane);
+    const scrollIndicator = (this.isPaused && scrollOffset > 0) ? ` [${scrollOffset}↑]` : '';
+    
+    const title = ` ${focusLabel}${namingInputLabel || processLabel}${hiddenLabel}${filterInputLabel || filterLabel}${scrollIndicator} `;
     
     const paneContainer = new BoxRenderable(this.renderer, {
       id: `pane-${pane.id}`,
       flexDirection: 'column',
       flexGrow: flexGrow,
-      flexShrink: 0, // Prevent shrinking - maintain 50/50 split
-      flexBasis: 0, // Use flexGrow ratio for sizing, not content size
+      flexShrink: 0,
+      flexBasis: 0,
       border: true,
       borderStyle: 'rounded',
       borderColor: borderColor,
@@ -3519,63 +3799,81 @@ class ProcessManager {
       titleAlignment: 'left',
       padding: 0,
       overflow: 'hidden',
-      backgroundColor: '#000000', // Black background for pane container
+      backgroundColor: '#000000',
     });
     
-    // Use passed height or calculate default for line count calculation
-    const height = availableHeight ? Math.max(5, availableHeight - 2) : Math.max(5, this.renderer.height - 6);
+    // Calculate visible height (minus border)
+    const visibleHeight = availableHeight ? Math.max(5, availableHeight - 2) : Math.max(5, this.renderer.height - 6);
     
-    const outputBox = new ScrollBoxRenderable(this.renderer, {
+    // Store visible height for scroll calculations
+    this.paneVisibleHeight.set(pane.id, visibleHeight);
+    
+    // Create output container (no ScrollBox - we handle scrolling virtually)
+    const outputBox = new BoxRenderable(this.renderer, {
       id: `pane-output-${pane.id}`,
-      height: height,
-      scrollX: false,
-      scrollY: true,
-      focusable: true,
-      style: {
-        rootOptions: {
-          flexGrow: 1,
-          flexShrink: 1,
-          flexBasis: 0,
-          paddingLeft: 1,
-          backgroundColor: '#000000',
-        },
-        contentOptions: {
-          backgroundColor: '#000000',
-          width: '100%',
-        },
-      },
+      flexDirection: 'column',
+      flexGrow: 1,
+      paddingLeft: 1,
+      backgroundColor: '#000000',
+      overflow: 'hidden',
+      shouldFill: true,
     });
     
-    // Show scrollbar when paused, hide when not paused
-    if (outputBox.verticalScrollBar) {
-      outputBox.verticalScrollBar.width = this.isPaused ? 1 : 0;
-    }
+    // Query only the visible lines from database
+    const lines = this.outputDb.queryVisible(pane, visibleHeight, scrollOffset);
     
-    // Store ScrollBox reference for this pane
-    this.paneScrollBoxes.set(pane.id, outputBox);
+    // Build content for visible lines
+    this.buildPaneOutputVirtual(pane, outputBox, lines, visibleHeight);
     
-    this.buildPaneOutput(pane, outputBox.content, height);
+    // Store reference to output box for updates
+    this.paneOutputBoxes.set(pane.id, outputBox);
     
-    // Update paneLineCount so updateRunningUI() won't re-add these lines
-    const paneLines = this.getOutputLinesForPane(pane);
-    if (paneLines.length > 0) {
-      this.paneLineCount.set(pane.id, paneLines[paneLines.length - 1].lineNumber);
-    }
-    
-    // Restore or set scroll position immediately
-    if (outputBox && outputBox.scrollTo) {
-      if (this.isPaused && this.paneScrollPositions.has(pane.id)) {
-        // Restore saved scroll position when paused
-        const savedPos = this.paneScrollPositions.get(pane.id);
-        outputBox.scrollTo(savedPos);
-      } else if (!this.isPaused) {
-        // Auto-scroll to bottom when not paused
-        outputBox.scrollTo({ x: 0, y: Number.MAX_SAFE_INTEGER });
-      }
+    // Track the last line number for incremental updates
+    if (lines.length > 0) {
+      this.paneLineCount.set(pane.id, lines[lines.length - 1].lineNumber);
     }
     
     paneContainer.add(outputBox);
     return paneContainer;
+  }
+  
+  // Build pane output with virtual scrolling - only renders visible lines
+  buildPaneOutputVirtual(pane, container, lines, visibleHeight) {
+    const isFocused = pane.id === this.focusedPaneId;
+    
+    // Determine copy mode selection range
+    const inCopyMode = this.isCopyMode && isFocused;
+    let copySelStart = -1;
+    let copySelEnd = -1;
+    if (inCopyMode && this.copyModeAnchor !== null) {
+      copySelStart = Math.min(this.copyModeAnchor, this.copyModeCursor);
+      copySelEnd = Math.max(this.copyModeAnchor, this.copyModeCursor);
+    }
+    
+    // Build all visible lines as single styled text
+    const chunks = [];
+    for (let i = 0; i < lines.length; i++) {
+      const lineContent = this.formatOutputLine(lines[i], i, inCopyMode, copySelStart, copySelEnd);
+      chunks.push(...lineContent.chunks);
+    }
+    
+    // Fill remaining visible area with blank lines to clear artifacts
+    for (let i = lines.length; i < visibleHeight; i++) {
+      chunks.push({ text: '\n' });
+    }
+    
+    // Create single TextRenderable with all visible content
+    const outputText = new TextRenderable(this.renderer, {
+      id: `output-${pane.id}`,
+      content: new StyledText(chunks),
+      bg: '#000000',
+      width: '100%',
+    });
+    
+    container.add(outputText);
+    
+    // Store reference for updates
+    this.lineRenderables.set(pane.id, [outputText]);
   }
   
   // Recursively build the pane layout, passing available height down
@@ -4162,6 +4460,11 @@ class ProcessManager {
     }
     
     // Remove old containers if they exist - use destroyRecursively to clean up all children
+    if (this.wipeContainer) {
+      this.renderer.root.remove(this.wipeContainer);
+      this.wipeContainer.destroyRecursively();
+      this.wipeContainer = null;
+    }
     if (this.selectionContainer) {
       this.renderer.root.remove(this.selectionContainer);
       this.selectionContainer.destroyRecursively();
@@ -4221,7 +4524,7 @@ class ProcessManager {
       const isVisible = this.isProcessVisibleInPane(script.name, focusedPane);
       const nameColor = isSelected ? COLORS.accent : (isVisible ? processColor : COLORS.textDim);
       const numberColor = isVisible ? processColor : COLORS.textDim;
-      const indicator = isSelected ? '>' : ' ';
+      const indicator = isSelected ? '❯' : ' ';
       const bracketColor = isVisible ? processColor : COLORS.textDim;
       
       // Show number for first 9 processes
@@ -4532,7 +4835,9 @@ async function main() {
     process.exit(1);
   }
 
-  const renderer = await createCliRenderer();
+  const renderer = await createCliRenderer({
+    backgroundColor: '#000000',
+  });
   renderer.start(); // Start the automatic render loop
   const manager = new ProcessManager(renderer, scripts);
   

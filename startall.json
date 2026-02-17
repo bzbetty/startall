@@ -6,29 +6,19 @@
     "demo:worker2",
     "demo:errors",
     "demo:longtext",
-    "demo:cmd"
+    "demo:cmd",
+    "test",
+    "demo:build"
   ],
   "paneLayout": {
     "type": "split",
     "direction": "vertical",
     "sizes": [
+      1,
       0.5,
-      0.5,
-      1
+      0.5
     ],
     "children": [
-      {
-        "type": "pane",
-        "name": "namedcontainer",
-        "processes": [],
-        "hidden": [
-          "demo:worker2",
-          "demo:worker",
-          "demo:backend"
-        ],
-        "filter": "",
-        "colorFilter": null
-      },
       {
         "type": "pane",
         "name": "",
@@ -49,16 +39,7 @@
             "type": "pane",
             "name": "",
             "processes": [],
-            "hidden": [
-              "demo:backend",
-              "demo:worker",
-              "demo:worker2",
-              "demo:errors",
-              "demo:build",
-              "demo:longtext",
-              "test",
-              "demo:frontend"
-            ],
+            "hidden": [],
             "filter": "",
             "colorFilter": null
           },
@@ -66,14 +47,35 @@
             "type": "pane",
             "name": "",
             "processes": [],
-            "hidden": [
-              "test",
-              "demo:frontend",
-              "demo:backend",
-              "demo:worker"
-            ],
+            "hidden": [],
             "filter": "",
-            "colorFilter": "yellow"
+            "colorFilter": null
+          }
+        ]
+      },
+      {
+        "type": "split",
+        "direction": "horizontal",
+        "sizes": [
+          1,
+          1
+        ],
+        "children": [
+          {
+            "type": "pane",
+            "name": "",
+            "processes": [],
+            "hidden": [],
+            "filter": "",
+            "colorFilter": null
+          },
+          {
+            "type": "pane",
+            "name": "",
+            "processes": [],
+            "hidden": [],
+            "filter": "",
+            "colorFilter": null
           }
         ]
       }
@@ -83,5 +85,7 @@
     "b": "demo:build",
     "[": "test"
   },
-  "showLineNumbers": false
+  "showLineNumbers": true,
+  "showPerformanceMetrics": true,
+  "showTimestamps": true
 }
